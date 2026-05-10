@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Cam Compiler</string>
+    <string name="merge_channel_name">Video merge progress</string>
+    <string name="merge_channel_desc">Shows progress while merging clips</string>
+</resources>
