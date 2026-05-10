@@ -15,18 +15,14 @@ import androidx.media3.transformer.ExportException
 import androidx.media3.transformer.ExportResult
 import androidx.media3.transformer.ProgressHolder
 import androidx.media3.transformer.Transformer
-import com.arthenica.ffmpegkit.FFmpegKit
-import com.arthenica.ffmpegkit.FFmpegKitConfig
-import com.arthenica.ffmpegkit.ReturnCode
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
-import kotlinx.coroutines.withContext
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
-import java.io.FileOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -39,9 +35,8 @@ object MergeEngine {
     }
 
     /**
-     * Merges the given clips in the given order. Reports progress via callback.
-     * Tries Media3 Transformer first (fast, hardware-accelerated).
-     * On failure, falls back to FFmpegKit (slower but more permissive).
+     * Merges the given clips in order using Media3 Transformer.
+     * Reports progress via callback.
      */
     suspend fun merge(
         ctx: Context,
@@ -52,29 +47,17 @@ object MergeEngine {
 
         val outputFile = createTempOutputFile(ctx)
 
-        // Try Media3 first
         onProgress(0f, "Merging with Media3 (hardware-accelerated)...")
-        val media3Result = tryMedia3(ctx, clipUris, outputFile, onProgress)
-        if (media3Result != null) {
+        val (success, errorMsg) = tryMedia3(ctx, clipUris, outputFile, onProgress)
+        if (success) {
             saveToDownloads(ctx, outputFile)
             outputFile.delete()
             return@coroutineScope Result.Success(outputFile.name, "Media3")
         }
 
-        // Fallback: FFmpegKit
-        onProgress(0f, "Media3 couldn't handle these clips. Falling back to FFmpegKit (slower)...")
         outputFile.delete()
-        val ffmpegOutput = createTempOutputFile(ctx)
-        val ffmpegSuccess = tryFFmpeg(ctx, clipUris, ffmpegOutput, onProgress)
-        if (ffmpegSuccess) {
-            saveToDownloads(ctx, ffmpegOutput)
-            ffmpegOutput.delete()
-            return@coroutineScope Result.Success(ffmpegOutput.name, "FFmpegKit")
-        }
-
-        ffmpegOutput.delete()
         return@coroutineScope Result.Failure(
-            "Both Media3 and FFmpegKit failed. Likely a codec issue. Try fewer clips first to identify which one is problematic."
+            "Merge failed: $errorMsg. This usually means the clips have mismatched codecs/resolutions. Try fewer clips at a time to identify which one is problematic."
         )
     }
 
@@ -84,8 +67,8 @@ object MergeEngine {
         clipUris: List<Uri>,
         outputFile: File,
         onProgress: (Float, String) -> Unit
-    ): Boolean = withContext(Dispatchers.Main) {
-        val deferred = CompletableDeferred<Boolean>()
+    ): Pair<Boolean, String> = withContext(Dispatchers.Main) {
+        val deferred = CompletableDeferred<Pair<Boolean, String>>()
 
         val mediaItems = clipUris.map { uri ->
             EditedMediaItem.Builder(MediaItem.fromUri(uri)).build()
@@ -96,10 +79,10 @@ object MergeEngine {
         val transformer = Transformer.Builder(ctx)
             .addListener(object : Transformer.Listener {
                 override fun onCompleted(c: Composition, r: ExportResult) {
-                    deferred.complete(true)
+                    deferred.complete(true to "")
                 }
                 override fun onError(c: Composition, r: ExportResult, e: ExportException) {
-                    deferred.complete(false)
+                    deferred.complete(false to (e.message ?: "unknown export error"))
                 }
             })
             .build()
@@ -107,7 +90,7 @@ object MergeEngine {
         try {
             transformer.start(composition, outputFile.absolutePath)
         } catch (e: Exception) {
-            return@withContext false
+            return@withContext false to (e.message ?: "failed to start transformer")
         }
 
         // Poll progress on a separate coroutine
@@ -116,71 +99,13 @@ object MergeEngine {
             while (isActive && !deferred.isCompleted) {
                 val state = transformer.getProgress(progressHolder)
                 if (state == Transformer.PROGRESS_STATE_AVAILABLE) {
-                    onProgress(progressHolder.progress / 100f, "Merging with Media3...")
+                    onProgress(progressHolder.progress / 100f, "Merging... (Media3)")
                 }
                 delay(500)
             }
         }
 
         deferred.await()
-    }
-
-    private suspend fun tryFFmpeg(
-        ctx: Context,
-        clipUris: List<Uri>,
-        outputFile: File,
-        onProgress: (Float, String) -> Unit
-    ): Boolean = withContext(Dispatchers.IO) {
-        try {
-            // FFmpeg can't read content:// URIs directly; copy to local cache files
-            onProgress(0.0f, "Preparing files for FFmpeg...")
-            val tempDir = File(ctx.cacheDir, "ffmpeg_input").apply {
-                deleteRecursively()
-                mkdirs()
-            }
-
-            val localFiles = mutableListOf<File>()
-            clipUris.forEachIndexed { idx, uri ->
-                val out = File(tempDir, "clip_%04d.mp4".format(idx))
-                ctx.contentResolver.openInputStream(uri)?.use { input ->
-                    FileOutputStream(out).use { output -> input.copyTo(output) }
-                }
-                localFiles.add(out)
-                onProgress(
-                    (idx + 1).toFloat() / clipUris.size * 0.3f,
-                    "Copying clip ${idx + 1} of ${clipUris.size}..."
-                )
-            }
-
-            // Build concat list
-            val listFile = File(tempDir, "list.txt")
-            listFile.writeText(localFiles.joinToString("\n") { "file '${it.absolutePath}'" })
-
-            // Try stream copy first (fast, no re-encode)
-            onProgress(0.35f, "Concatenating with FFmpeg (stream copy)...")
-            val streamCopyCmd = "-y -f concat -safe 0 -i ${listFile.absolutePath} -c copy ${outputFile.absolutePath}"
-            val session = FFmpegKit.execute(streamCopyCmd)
-
-            if (ReturnCode.isSuccess(session.returnCode)) {
-                tempDir.deleteRecursively()
-                onProgress(1f, "Done!")
-                return@withContext true
-            }
-
-            // Stream copy failed -> try re-encode (slower but handles mixed codecs)
-            onProgress(0.4f, "Stream copy failed, re-encoding (this is slower)...")
-            val reEncodeCmd = "-y -f concat -safe 0 -i ${listFile.absolutePath} -c:v libx264 -preset ultrafast -crf 23 -c:a aac ${outputFile.absolutePath}"
-            val session2 = FFmpegKit.execute(reEncodeCmd)
-            tempDir.deleteRecursively()
-
-            if (ReturnCode.isSuccess(session2.returnCode)) {
-                onProgress(1f, "Done!")
-                return@withContext true
-            }
-            return@withContext false
-        } catch (e: Exception) {
-            return@withContext false
-        }
     }
 
     private fun createTempOutputFile(ctx: Context): File {
