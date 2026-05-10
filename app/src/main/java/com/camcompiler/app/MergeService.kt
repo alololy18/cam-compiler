@@ -1,0 +1,174 @@
+package com.camcompiler.app
+
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.Binder
+import android.os.Build
+import android.os.IBinder
+import androidx.core.app.NotificationCompat
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+
+class MergeService : Service() {
+
+    private val scope = CoroutineScope(SupervisorJob())
+    private var currentJob: Job? = null
+    private val binder = LocalBinder()
+
+    var status: String = "Idle"
+    var progress: Float = 0f
+    var isRunning: Boolean = false
+    var lastResult: MergeEngine.Result? = null
+
+    var listener: ((Float, String, MergeEngine.Result?) -> Unit)? = null
+
+    inner class LocalBinder : Binder() {
+        fun getService(): MergeService = this@MergeService
+    }
+
+    override fun onBind(intent: Intent?): IBinder = binder
+
+    override fun onCreate() {
+        super.onCreate()
+        createNotificationChannel()
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val action = intent?.action
+        if (action == ACTION_CANCEL) {
+            cancelMerge()
+            return START_NOT_STICKY
+        }
+
+        @Suppress("DEPRECATION", "UNCHECKED_CAST")
+        val urisStr = intent?.getStringArrayListExtra(EXTRA_URIS) ?: arrayListOf()
+        val uris = urisStr.map { Uri.parse(it) }
+        if (uris.isEmpty()) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        startForeground(NOTIF_ID, buildNotification("Starting merge...", 0f, false))
+        startMerge(uris)
+        return START_NOT_STICKY
+    }
+
+    private fun startMerge(uris: List<Uri>) {
+        if (isRunning) return
+        isRunning = true
+        currentJob = scope.launch {
+            val result = MergeEngine.merge(this@MergeService, uris) { p, s ->
+                progress = p
+                status = s
+                listener?.invoke(p, s, null)
+                updateNotification(s, p, true)
+            }
+            lastResult = result
+            isRunning = false
+            val finalMsg = when (result) {
+                is MergeEngine.Result.Success -> "Done! Saved to Downloads (${result.method})"
+                is MergeEngine.Result.Failure -> "Failed: ${result.message}"
+            }
+            status = finalMsg
+            progress = 1f
+            listener?.invoke(1f, finalMsg, result)
+            updateNotification(finalMsg, 1f, false)
+            // Brief delay so user sees the final notification, then stop foreground
+            kotlinx.coroutines.delay(1500)
+            stopForeground(STOP_FOREGROUND_DETACH)
+            stopSelf()
+        }
+    }
+
+    fun cancelMerge() {
+        currentJob?.cancel()
+        isRunning = false
+        status = "Cancelled"
+        listener?.invoke(0f, "Cancelled", null)
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                getString(R.string.merge_channel_name),
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = getString(R.string.merge_channel_desc)
+                setShowBadge(false)
+            }
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            nm.createNotificationChannel(channel)
+        }
+    }
+
+    private fun buildNotification(text: String, progress: Float, ongoing: Boolean): android.app.Notification {
+        val openIntent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
+        }
+        val openPi = PendingIntent.getActivity(
+            this, 0, openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val cancelIntent = Intent(this, MergeService::class.java).apply {
+            action = ACTION_CANCEL
+        }
+        val cancelPi = PendingIntent.getService(
+            this, 1, cancelIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("Cam Compiler")
+            .setContentText(text)
+            .setSmallIcon(android.R.drawable.ic_menu_camera)
+            .setContentIntent(openPi)
+            .setOngoing(ongoing)
+            .setOnlyAlertOnce(true)
+
+        if (ongoing) {
+            builder.setProgress(100, (progress * 100).toInt(), progress < 0.01f)
+            builder.addAction(0, "Cancel", cancelPi)
+        }
+        return builder.build()
+    }
+
+    private fun updateNotification(text: String, progress: Float, ongoing: Boolean) {
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        nm.notify(NOTIF_ID, buildNotification(text, progress, ongoing))
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        scope.cancel()
+    }
+
+    companion object {
+        const val CHANNEL_ID = "merge_progress"
+        const val NOTIF_ID = 1001
+        const val EXTRA_URIS = "extra_uris"
+        const val ACTION_CANCEL = "com.camcompiler.app.CANCEL"
+
+        fun start(ctx: Context, uris: List<Uri>) {
+            val intent = Intent(ctx, MergeService::class.java).apply {
+                putStringArrayListExtra(EXTRA_URIS, ArrayList(uris.map { it.toString() }))
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                ctx.startForegroundService(intent)
+            } else {
+                ctx.startService(intent)
+            }
+        }
+    }
+}
