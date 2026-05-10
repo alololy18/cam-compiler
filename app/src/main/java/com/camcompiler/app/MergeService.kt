@@ -6,11 +6,13 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.net.Uri
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -48,7 +50,7 @@ class MergeService : Service() {
             return START_NOT_STICKY
         }
 
-        @Suppress("DEPRECATION", "UNCHECKED_CAST")
+        @Suppress("DEPRECATION")
         val urisStr = intent?.getStringArrayListExtra(EXTRA_URIS) ?: arrayListOf()
         val uris = urisStr.map { Uri.parse(it) }
         if (uris.isEmpty()) {
@@ -56,7 +58,19 @@ class MergeService : Service() {
             return START_NOT_STICKY
         }
 
-        startForeground(NOTIF_ID, buildNotification("Starting merge...", 0f, false))
+        // Use ServiceCompat.startForeground with type for Android 14+ compatibility
+        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+        } else {
+            0
+        }
+        ServiceCompat.startForeground(
+            this,
+            NOTIF_ID,
+            buildNotification("Starting merge...", 0f, true),
+            type
+        )
+
         startMerge(uris)
         return START_NOT_STICKY
     }
@@ -83,7 +97,7 @@ class MergeService : Service() {
             updateNotification(finalMsg, 1f, false)
             // Brief delay so user sees the final notification, then stop foreground
             kotlinx.coroutines.delay(1500)
-            stopForeground(STOP_FOREGROUND_DETACH)
+            ServiceCompat.stopForeground(this@MergeService, ServiceCompat.STOP_FOREGROUND_DETACH)
             stopSelf()
         }
     }
@@ -93,7 +107,7 @@ class MergeService : Service() {
         isRunning = false
         status = "Cancelled"
         listener?.invoke(0f, "Cancelled", null)
-        stopForeground(STOP_FOREGROUND_REMOVE)
+        ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
 
