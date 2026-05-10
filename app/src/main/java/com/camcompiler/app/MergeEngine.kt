@@ -73,8 +73,10 @@ object MergeEngine {
         val mediaItems = clipUris.map { uri ->
             EditedMediaItem.Builder(MediaItem.fromUri(uri)).build()
         }
-        val sequence = EditedMediaItemSequence.Builder(mediaItems).build()
-        val composition = Composition.Builder(sequence).build()
+        // Media3 1.4.1 API: use the List constructor directly
+        val sequence = EditedMediaItemSequence(mediaItems)
+        // Composition.Builder needs explicit cast to disambiguate the overload
+        val composition: Composition = Composition.Builder(listOf(sequence)).build()
 
         val transformer = Transformer.Builder(ctx)
             .addListener(object : Transformer.Listener {
