@@ -70,8 +70,7 @@ dependencies {
     implementation("androidx.media3:media3-common:$media3Version")
     implementation("androidx.media3:media3-exoplayer:$media3Version")
 
-    // FFmpegKit - fallback for codec mismatches
-    implementation("com.arthenica:ffmpeg-kit-min:6.0-2")
+
 
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
