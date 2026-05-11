@@ -1026,12 +1026,12 @@ private fun MergeScreen(
         // Sort info
         vm.lastSortInfo?.let { si ->
             Spacer(Modifier.height(4.dp))
-            val note = when {
-                si.fellBackToMtime > 0 -> "Sorted chronologically  •  ${si.fellBackToMtime} fallback to file time"
-                else -> "Sorted chronologically by filename timestamp"
-            }
-            Text(note, fontSize = 11.sp,
-                color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f))
+            Text(
+                si.warning ?: si.strategy,
+                fontSize = 11.sp,
+                color = if (si.warning != null) MaterialTheme.colorScheme.tertiary
+                    else MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f)
+            )
         }
 
         // Status / warnings
@@ -1463,14 +1463,6 @@ fun ClipRow(
             }
         }
     }
-}
-
-fun formatDuration(totalSeconds: Long): String {
-    val h = totalSeconds / 3600
-    val m = (totalSeconds % 3600) / 60
-    val s = totalSeconds % 60
-    return if (h > 0) "%d:%02d:%02d".format(h, m, s)
-        else "%d:%02d".format(m, s)
 }
 
 fun playVideo(context: android.content.Context, uri: Uri) {
