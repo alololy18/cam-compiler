@@ -28,8 +28,10 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.ContentCut
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.PlayCircle
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Tune
@@ -81,6 +83,46 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     var pendingMismatches by mutableStateOf<List<ClipAnalyzer.Mismatch>>(emptyList())
     var pendingMergeUrisForDialog by mutableStateOf<List<Uri>>(emptyList())
     var showMismatchDialog by mutableStateOf(false)
+
+    // Per-clip edit state. Keys are clip URIs; missing entries mean "no edits".
+    var clipEdits by mutableStateOf<Map<Uri, ClipEdit>>(emptyMap())
+        private set
+
+    // Project-level music URI. null = no music.
+    var musicUri by mutableStateOf<Uri?>(null)
+    var musicName by mutableStateOf<String?>(null)
+    var musicVolume by mutableStateOf(0.5f)
+    var originalAudioVolume by mutableStateOf(1.0f)
+
+    // Trim dialog state — which clip URI is being trimmed (null = not open)
+    var trimmingClipUri by mutableStateOf<Uri?>(null)
+
+    fun setClipEdit(uri: Uri, edit: ClipEdit) {
+        clipEdits = clipEdits + (uri to edit)
+    }
+
+    fun clearClipEdit(uri: Uri) {
+        clipEdits = clipEdits - uri
+    }
+
+    fun setMusic(uri: Uri?, name: String?) {
+        musicUri = uri
+        musicName = name
+    }
+
+    fun getEditForClip(uri: Uri): ClipEdit =
+        clipEdits[uri] ?: ClipEdit(uri)
+
+    /** Builds the EditProject for the given selected clip URIs. */
+    fun buildEditProject(selectedUris: List<Uri>): EditProject {
+        val edits = selectedUris.map { getEditForClip(it) }
+        return EditProject(
+            clipEdits = edits,
+            musicUri = musicUri,
+            musicVolume = musicVolume,
+            originalAudioVolume = originalAudioVolume
+        )
+    }
 
     init {
         loadLastFolder()
@@ -397,8 +439,6 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun beginSaveAs(uris: List<Uri>) {
-        // Analyze clips first. If they're uniform, go straight to save-as in Fast mode.
-        // If they differ, ask the user via the ViewModel's mismatch dialog.
         vm.status = "Analyzing clips..."
         vm.isProcessing = false
         lifecycleScope.launch {
@@ -408,22 +448,49 @@ class MainActivity : ComponentActivity() {
             val analysis = withContext(Dispatchers.IO) {
                 ClipAnalyzer.analyze(this@MainActivity, uris, names)
             }
-            when (analysis) {
-                is ClipAnalyzer.AnalysisResult.Uniform -> {
-                    vm.status = "Clips are uniform. Ready to fast-merge."
-                    pendingMode = MergeEngine.Mode.FAST
-                    launchSaveAsDialog(uris)
+            val project = vm.buildEditProject(uris)
+
+            // Decide mode based on what's in the project + analysis
+            val musicPresent = project.hasMusic()
+            val codecMixed = analysis is ClipAnalyzer.AnalysisResult.Mixed
+
+            // Check if any trim is non-keyframe-aligned (forces re-encode).
+            // For simplicity, treat any clip with non-default trim as potentially non-aligned
+            // unless we verify by loading its keyframe index. To keep this responsive,
+            // we trust that the trim dialog snapped to keyframes when user chose "snap" mode.
+            // The reliable check is: if a clip has edits AND musicPresent is false AND
+            // codecs match, try FAST; if MediaMuxer fails (due to non-alignment), it returns an error
+            // and we surface to the user.
+
+            when {
+                musicPresent -> {
+                    // Music always requires re-encode — show informational confirm
+                    vm.status = "Music will require re-encoding (slower)."
+                    vm.pendingMergeUrisForDialog = uris
+                    vm.pendingMismatches = listOf(
+                        ClipAnalyzer.Mismatch(
+                            clipName = "Music track added",
+                            differences = listOf(
+                                "Background music: ${vm.musicName ?: "audio"}",
+                                "Re-encoding required to mix audio"
+                            )
+                        )
+                    )
+                    vm.showMismatchDialog = true
                 }
-                is ClipAnalyzer.AnalysisResult.Mixed -> {
-                    vm.status = "${analysis.mismatches.size} of ${uris.size} clips differ — re-encoding needed."
-                    vm.pendingMismatches = analysis.mismatches
+                codecMixed -> {
+                    val mixed = analysis as ClipAnalyzer.AnalysisResult.Mixed
+                    vm.status = "${mixed.mismatches.size} of ${uris.size} clips differ — re-encoding needed."
+                    vm.pendingMismatches = mixed.mismatches
                     vm.pendingMergeUrisForDialog = uris
                     vm.showMismatchDialog = true
                 }
-                is ClipAnalyzer.AnalysisResult.Failed -> {
-                    Toast.makeText(this@MainActivity,
-                        "Could not analyze clips: ${analysis.message}", Toast.LENGTH_LONG).show()
-                    vm.status = "Analysis failed: ${analysis.message}"
+                else -> {
+                    // Uniform codecs, no music — fast path
+                    vm.status = if (project.hasClipEdits()) "Clips trimmed — fast merge."
+                        else "Clips are uniform — fast merge."
+                    pendingMode = MergeEngine.Mode.FAST
+                    launchSaveAsDialog(uris)
                 }
             }
         }
@@ -459,7 +526,8 @@ class MainActivity : ComponentActivity() {
         vm.progress = 0f
         vm.status = "Starting (${if (mode == MergeEngine.Mode.FAST) "Fast" else "Compatible"} mode)..."
         vm.lastMergedOutputUri = outputUri
-        MergeService.start(this, uris, outputUri, mode)
+        val project = vm.buildEditProject(uris)
+        MergeService.start(this, project, outputUri, mode)
         bindService(Intent(this, MergeService::class.java), connection, Context.BIND_AUTO_CREATE)
     }
 
@@ -489,6 +557,21 @@ fun AppScreen(
                 )
             } catch (_: Exception) {}
             vm.setFolder(uri)
+        }
+    }
+
+    // Music picker — choose audio file to mix into the merge
+    val musicPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            try {
+                context.contentResolver.takePersistableUriPermission(
+                    uri, Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            } catch (_: Exception) {}
+            val name = uri.lastPathSegment?.substringAfterLast('/')?.substringAfterLast(':') ?: "audio"
+            vm.setMusic(uri, name)
         }
     }
 
@@ -606,6 +689,57 @@ fun AppScreen(
                 Spacer(Modifier.width(8.dp))
                 Text("Merge ALL ${vm.clips.size} clips  •  ${formatDuration(vm.totalAllDuration())}  •  ${"%.0f".format(vm.totalAllSizeMb())} MB")
             }
+
+            // Music picker row
+            Spacer(Modifier.height(6.dp))
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
+                    .clickable { musicPicker.launch(arrayOf("audio/*")) }
+                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    Icons.Filled.MusicNote,
+                    null,
+                    modifier = Modifier.size(16.dp),
+                    tint = if (vm.musicUri != null) MaterialTheme.colorScheme.primary
+                        else MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(Modifier.width(8.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    if (vm.musicUri != null) {
+                        Text(
+                            "Music: ${vm.musicName ?: "audio"}",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.primary,
+                            maxLines = 1
+                        )
+                        Text(
+                            "Tap to change  •  will force re-encoding",
+                            fontSize = 10.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    } else {
+                        Text(
+                            "Add background music",
+                            fontSize = 12.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+                if (vm.musicUri != null) {
+                    TextButton(
+                        onClick = { vm.setMusic(null, null) },
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
+                    ) {
+                        Text("Remove", fontSize = 11.sp)
+                    }
+                }
+            }
         }
 
         if (vm.isProcessing) {
@@ -690,10 +824,12 @@ fun AppScreen(
             items(vm.clips) { clip ->
                 ClipRow(
                     clip = clip,
+                    clipEdit = vm.getEditForClip(clip.uri),
                     selectionIndex = vm.selectionOrder.indexOf(clip.uri).takeIf { it >= 0 },
                     manageMode = vm.manageMode,
                     onClick = { if (!vm.isProcessing) vm.toggleSelection(clip.uri) },
-                    onPlayClick = { playVideo(context, clip.uri) }
+                    onPlayClick = { playVideo(context, clip.uri) },
+                    onTrimClick = { vm.trimmingClipUri = clip.uri }
                 )
             }
         }
@@ -881,15 +1017,38 @@ fun AppScreen(
             }
         )
     }
+
+    // Trim editor — opens when a clip's trim button is tapped
+    val trimmingUri = vm.trimmingClipUri
+    if (trimmingUri != null) {
+        val clipToTrim = vm.clips.firstOrNull { it.uri == trimmingUri }
+        if (clipToTrim != null) {
+            TrimEditorDialog(
+                clip = clipToTrim,
+                initialEdit = vm.getEditForClip(trimmingUri),
+                onSave = { newEdit ->
+                    if (newEdit.hasEdits()) vm.setClipEdit(trimmingUri, newEdit)
+                    else vm.clearClipEdit(trimmingUri)
+                    vm.trimmingClipUri = null
+                },
+                onCancel = { vm.trimmingClipUri = null }
+            )
+        } else {
+            // Clip disappeared (deleted/refreshed) — close the dialog
+            vm.trimmingClipUri = null
+        }
+    }
 }
 
 @Composable
 fun ClipRow(
     clip: VideoClip,
+    clipEdit: ClipEdit,
     selectionIndex: Int?,
     manageMode: Boolean,
     onClick: () -> Unit,
-    onPlayClick: () -> Unit
+    onPlayClick: () -> Unit,
+    onTrimClick: () -> Unit
 ) {
     val isSelected = selectionIndex != null
     val borderColor = when {
@@ -928,11 +1087,33 @@ fun ClipRow(
         Spacer(Modifier.width(4.dp))
         Column(modifier = Modifier.weight(1f)) {
             Text(clip.name, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, maxLines = 1)
+            val trimSuffix = if (clipEdit.hasEdits()) {
+                val effDuration = clipEdit.effectiveDurationMs(clip.durationSec * 1000L) / 1000
+                val effRanges = clipEdit.effectiveRanges(clip.durationSec * 1000L)
+                val segCount = if (effRanges.size > 1) " (${effRanges.size} segments)" else ""
+                "  •  trimmed: ${formatDuration(effDuration)}$segCount"
+            } else ""
             Text(
-                "${formatDuration(clip.durationSec)}  •  ${"%.1f".format(clip.sizeMb)} MB",
+                "${formatDuration(clip.durationSec)}  •  ${"%.1f".format(clip.sizeMb)} MB$trimSuffix",
                 fontSize = 11.sp,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
+                color = if (clipEdit.hasEdits()) MaterialTheme.colorScheme.primary
+                    else MaterialTheme.colorScheme.onSurfaceVariant
             )
+        }
+        // Trim button - shown when not in manage mode
+        if (!manageMode) {
+            IconButton(
+                onClick = onTrimClick,
+                modifier = Modifier.size(36.dp)
+            ) {
+                Icon(
+                    Icons.Filled.ContentCut,
+                    contentDescription = "Trim clip",
+                    tint = if (clipEdit.hasEdits()) MaterialTheme.colorScheme.primary
+                        else MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(18.dp)
+                )
+            }
         }
         // Right-side indicator: depends on mode + selection
         when {
