@@ -11,8 +11,8 @@ android {
         applicationId = "com.camcompiler.app"
         minSdk = 24
         targetSdk = 34
-        versionCode = 7
-        versionName = "7.0"
+        versionCode = 8
+        versionName = "8.0"
     }
 
     buildTypes {
@@ -64,12 +64,13 @@ dependencies {
     implementation("androidx.compose.material:material-icons-extended")
     debugImplementation("androidx.compose.ui:ui-tooling")
 
-    // Media3 - used only for the re-encode Compatible mode when clips differ
+    // Media3 - re-encoding (Compatible mode) AND ExoPlayer + PlayerView for trim preview
     val media3Version = "1.4.1"
     implementation("androidx.media3:media3-transformer:$media3Version")
     implementation("androidx.media3:media3-effect:$media3Version")
     implementation("androidx.media3:media3-common:$media3Version")
     implementation("androidx.media3:media3-exoplayer:$media3Version")
+    implementation("androidx.media3:media3-ui:$media3Version")
 
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
