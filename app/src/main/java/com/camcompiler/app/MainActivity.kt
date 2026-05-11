@@ -717,6 +717,14 @@ fun AppScreen(
                     else vm.clearClipEdit(trimmingUri)
                     vm.trimmingClipUri = null
                 },
+                onExport = { newEdit ->
+                    // Commit edit, close trim dialog, trigger single-clip save-as merge
+                    if (newEdit.hasEdits()) vm.setClipEdit(trimmingUri, newEdit)
+                    else vm.clearClipEdit(trimmingUri)
+                    vm.trimmingClipUri = null
+                    // Kick off save-as for just this clip
+                    onStartSaveAs(listOf(trimmingUri))
+                },
                 onCancel = { vm.trimmingClipUri = null }
             )
         } else {
