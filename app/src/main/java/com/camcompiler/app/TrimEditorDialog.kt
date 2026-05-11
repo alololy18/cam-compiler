@@ -75,7 +75,7 @@ fun TrimEditorDialog(
     // Export preview state: when true, we're in the preview-before-commit overlay
     var showExportPreview by remember { mutableStateOf(false) }
 
-    var snapToKeyframes by remember { mutableStateOf(true) }
+    var snapToKeyframes by remember { mutableStateOf(false) }
     var keyframes by remember { mutableStateOf<List<Long>>(emptyList()) }
     var keyframesLoaded by remember { mutableStateOf(false) }
 
@@ -309,6 +309,16 @@ fun TrimEditorDialog(
                             newRanges[idx] = TrimRange(current.startMs, snapped)
                             ranges = newRanges
                         },
+                        onPlayheadSeek = { ms ->
+                            exoPlayer.seekTo(ms.coerceIn(0L, clipDurationMs))
+                        }
+                    )
+
+                    // Dedicated playhead control strip below the scrubber.
+                    // Grab the pinhead and drag to seek through the source clip.
+                    PlayheadStrip(
+                        durationMs = clipDurationMs,
+                        playheadMs = playerPositionMs,
                         onPlayheadSeek = { ms ->
                             exoPlayer.seekTo(ms.coerceIn(0L, clipDurationMs))
                         }
@@ -686,7 +696,7 @@ private fun MultiRegionScrubber(
                 )
             }
 
-            // Playhead
+            // Playhead line — non-interactive; the user drags the pinhead strip below.
             val playheadDp = with(density) { msToX(playheadMs).toDp() }
             Box(
                 modifier = Modifier
@@ -695,6 +705,105 @@ private fun MultiRegionScrubber(
                     .height(72.dp)
                     .background(Color.White)
             )
+        }
+    }
+}
+
+// ============================================================================
+// Dedicated playhead control strip — sits below the scrubber.
+//
+// A thin row containing a horizontal reference line and a draggable pinhead.
+// The pinhead is always grabbable regardless of what's in the scrubber above.
+// During drag, the player seeks live so frames update under the user's finger.
+// ============================================================================
+
+@Composable
+private fun PlayheadStrip(
+    durationMs: Long,
+    playheadMs: Long,
+    onPlayheadSeek: (Long) -> Unit
+) {
+    val density = LocalDensity.current
+
+    // Absolute-position drag state: during drag, this overrides the prop-driven position
+    // so live-scrub seeks don't cause the visual to jitter from prop updates.
+    var dragAbsoluteMs by remember { mutableStateOf<Long?>(null) }
+    val renderMs = dragAbsoluteMs ?: playheadMs
+
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(28.dp)
+    ) {
+        BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+            val widthPx = with(density) { maxWidth.toPx() }
+            val msToX = { ms: Long ->
+                if (durationMs > 0) (ms.toFloat() / durationMs) * widthPx else 0f
+            }
+            val xToMs = { x: Float ->
+                if (widthPx > 0) ((x / widthPx) * durationMs).toLong() else 0L
+            }
+
+            // Reference line through center of strip
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(2.dp)
+                    .align(Alignment.Center)
+                    .background(MaterialTheme.colorScheme.outline.copy(alpha = 0.4f))
+            )
+
+            // Tap-to-seek anywhere on the strip (drawn behind pinhead so pinhead drag wins)
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .pointerInput(durationMs) {
+                        detectTapGestures { offset ->
+                            onPlayheadSeek(xToMs(offset.x).coerceIn(0L, durationMs))
+                        }
+                    }
+            )
+
+            // Pinhead at playhead position. 48dp touch target, 18dp visible circle.
+            val pinDp = with(density) { msToX(renderMs).toDp() }
+            Box(
+                modifier = Modifier
+                    .offset(x = pinDp - 24.dp, y = 0.dp)
+                    .width(48.dp)
+                    .height(28.dp)
+                    .pointerInput(durationMs) {
+                        detectDragGestures(
+                            onDragStart = { dragAbsoluteMs = playheadMs },
+                            onDragEnd = {
+                                val finalMs = (dragAbsoluteMs ?: playheadMs)
+                                    .coerceIn(0L, durationMs)
+                                dragAbsoluteMs = null
+                                onPlayheadSeek(finalMs)
+                            },
+                            onDragCancel = { dragAbsoluteMs = null },
+                            onDrag = { _, dragAmount ->
+                                val deltaMs = xToMs(dragAmount.x)
+                                val current = dragAbsoluteMs ?: playheadMs
+                                val proposed = (current + deltaMs).coerceIn(0L, durationMs)
+                                dragAbsoluteMs = proposed
+                                onPlayheadSeek(proposed)
+                            }
+                        )
+                    }
+            ) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.Center)
+                        .size(18.dp)
+                        .clip(RoundedCornerShape(9.dp))
+                        .background(Color.White)
+                        .border(
+                            width = 2.dp,
+                            color = MaterialTheme.colorScheme.primary,
+                            shape = RoundedCornerShape(9.dp)
+                        )
+                )
+            }
         }
     }
 }
@@ -1052,6 +1161,10 @@ private fun ExportPreviewOverlay(
         }
     }
 
+    // Transition overlay state: when non-null, we're "in" a transition and the player is paused.
+    // The overlay covers the video with the transition color (black/white) for the configured duration.
+    var currentTransition by remember { mutableStateOf<Transition?>(null) }
+
     // Seek to the first range when overlay opens
     LaunchedEffect(Unit) {
         if (effectiveRanges.isNotEmpty()) {
@@ -1060,18 +1173,34 @@ private fun ExportPreviewOverlay(
         }
     }
 
-    // Monitor playback: track position + advance when range ends
-    LaunchedEffect(previewPlayer, effectiveRanges) {
+    // Monitor playback: track position + advance when range ends.
+    // When advancing, check if there's a transition between segments and simulate it.
+    LaunchedEffect(previewPlayer, effectiveRanges, edit) {
         while (true) {
             isPlaying = previewPlayer.isPlaying
             playerPositionMs = previewPlayer.currentPosition
-            if (effectiveRanges.isNotEmpty() && currentRangeIdx < effectiveRanges.size) {
+            if (effectiveRanges.isNotEmpty() && currentRangeIdx < effectiveRanges.size
+                && currentTransition == null) {
                 val r = effectiveRanges[currentRangeIdx]
                 if (previewPlayer.currentPosition >= r.endMs && previewPlayer.isPlaying) {
                     val next = currentRangeIdx + 1
                     if (next < effectiveRanges.size) {
-                        currentRangeIdx = next
-                        previewPlayer.seekTo(effectiveRanges[next].startMs)
+                        // Check transition between segment currentRangeIdx and next
+                        val t = edit.transitionAt(currentRangeIdx)
+                        if (t != Transition.NONE) {
+                            // Pause player, show overlay for the transition duration, then resume
+                            previewPlayer.pause()
+                            currentTransition = t
+                            delay(t.durationMs)
+                            currentTransition = null
+                            currentRangeIdx = next
+                            previewPlayer.seekTo(effectiveRanges[next].startMs)
+                            previewPlayer.play()
+                        } else {
+                            // No transition — seamless advance
+                            currentRangeIdx = next
+                            previewPlayer.seekTo(effectiveRanges[next].startMs)
+                        }
                     } else {
                         previewPlayer.pause()
                         previewPlayer.seekTo(effectiveRanges[0].startMs)
@@ -1127,6 +1256,16 @@ private fun ExportPreviewOverlay(
                     },
                     modifier = Modifier.fillMaxSize()
                 )
+                // Transition overlay — black or white covers the video during a simulated transition.
+                // Matches what the engine renders: a solid color frame of the configured duration.
+                val ct = currentTransition
+                if (ct != null) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(if (ct.isWhite) Color.White else Color.Black)
+                    )
+                }
             }
 
             // ===== Output-timeline scrubber =====
