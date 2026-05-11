@@ -3,14 +3,25 @@ package com.camcompiler.app
 /**
  * Transition types between adjacent segments (clips in a merge OR ranges in a clip's trim).
  *
- * All non-NONE transitions force re-encoding because they require pixel-level work
- * (fade-to-black requires modulating brightness over time; hold-black requires
- * inserting black frames).
+ * All non-NONE transitions force re-encoding because they require pixel-level work.
+ *
+ * Implementation note (Media3 1.4.1):
+ *  - Each non-NONE transition is rendered as an inserted image segment (black or white)
+ *    with the specified duration.
+ *  - True alpha-fade / cross-dissolve transitions are not feasible in 1.4.1 without
+ *    custom shaders — those are planned for v9 with Media3 1.5+.
  */
-enum class Transition(val displayName: String, val shortLabel: String) {
-    NONE("No transition", "None"),
-    FADE_BLACK("Fade to black", "Fade"),
-    HOLD_BLACK("Hold on black", "Hold");
+enum class Transition(
+    val displayName: String,
+    val shortLabel: String,
+    val durationMs: Long,
+    val isWhite: Boolean = false
+) {
+    NONE("No transition", "None", 0L),
+    CUT_BLACK("Cut to black (short)", "Cut", 200L),
+    HOLD_BLACK("Hold on black", "Hold", 500L),
+    FADE_BLACK("Fade through black (slow)", "Fade", 800L),
+    FLASH_WHITE("White flash", "Flash", 200L, isWhite = true);
 
     /** Cycle to the next transition type. */
     fun next(): Transition = entries[(ordinal + 1) % entries.size]
@@ -19,10 +30,8 @@ enum class Transition(val displayName: String, val shortLabel: String) {
     fun requiresReencode(): Boolean = this != NONE
 
     companion object {
-        /** Default transition duration in milliseconds. */
+        // Kept for compatibility; new code should use Transition.durationMs directly.
         const val DURATION_MS = 500L
-
-        /** Duration of the held black insert for HOLD_BLACK. */
         const val HOLD_DURATION_MS = 300L
     }
 }
