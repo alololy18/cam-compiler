@@ -56,8 +56,10 @@ class MergeService : Service() {
         @Suppress("DEPRECATION")
         val urisStr = intent?.getStringArrayListExtra(EXTRA_URIS) ?: arrayListOf()
         val outputUriStr = intent?.getStringExtra(EXTRA_OUTPUT_URI)
+        val modeName = intent?.getStringExtra(EXTRA_MODE) ?: MergeEngine.Mode.FAST.name
         val uris = urisStr.map { Uri.parse(it) }
         val outputUri = outputUriStr?.let { Uri.parse(it) }
+        val mode = try { MergeEngine.Mode.valueOf(modeName) } catch (_: Exception) { MergeEngine.Mode.FAST }
 
         if (uris.isEmpty() || outputUri == null) {
             stopSelf()
@@ -75,15 +77,15 @@ class MergeService : Service() {
         )
 
         lastSourceUris = uris
-        startMerge(uris, outputUri)
+        startMerge(uris, outputUri, mode)
         return START_NOT_STICKY
     }
 
-    private fun startMerge(uris: List<Uri>, outputUri: Uri) {
+    private fun startMerge(uris: List<Uri>, outputUri: Uri, mode: MergeEngine.Mode) {
         if (isRunning) return
         isRunning = true
         currentJob = scope.launch {
-            val result = MergeEngine.merge(this@MergeService, uris, outputUri) { p, s ->
+            val result = MergeEngine.merge(this@MergeService, uris, outputUri, mode) { p, s ->
                 progress = p
                 status = s
                 listener?.invoke(p, s, null)
@@ -175,12 +177,14 @@ class MergeService : Service() {
         const val NOTIF_ID = 1001
         const val EXTRA_URIS = "extra_uris"
         const val EXTRA_OUTPUT_URI = "extra_output_uri"
+        const val EXTRA_MODE = "extra_mode"
         const val ACTION_CANCEL = "com.camcompiler.app.CANCEL"
 
-        fun start(ctx: Context, uris: List<Uri>, outputUri: Uri) {
+        fun start(ctx: Context, uris: List<Uri>, outputUri: Uri, mode: MergeEngine.Mode) {
             val intent = Intent(ctx, MergeService::class.java).apply {
                 putStringArrayListExtra(EXTRA_URIS, ArrayList(uris.map { it.toString() }))
                 putExtra(EXTRA_OUTPUT_URI, outputUri.toString())
+                putExtra(EXTRA_MODE, mode.name)
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 ctx.startForegroundService(intent)
