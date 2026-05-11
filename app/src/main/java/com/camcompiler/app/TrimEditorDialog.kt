@@ -4,16 +4,18 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowDownward
 import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.*
@@ -44,16 +46,18 @@ import kotlinx.coroutines.withContext
  * Fullscreen multi-range trim editor.
  *
  * Layout:
- *   - Top bar: Title + Cancel + Save
- *   - ExoPlayer preview
- *   - Time readouts + playback controls
- *   - Multi-region scrubber (tap a region to select; drag handles to resize)
- *   - "Add range" button + Mode toggle (Keep / Remove)
- *   - Selected range: number entry fields + Delete button + reorder arrows (Keep mode)
- *   - "Snap to keyframes" toggle
+ *  - Fixed header (title + Cancel + Save) at top
+ *  - Fixed video preview below header
+ *  - SCROLLABLE body with: time readouts, playback, scrubber, range list, mode toggle,
+ *    time entry, snap toggle, keyframe info, instructions
  *
- * The dialog operates on a local working copy of the ClipEdit, only committing
- * back via onSave when the user taps Save.
+ * Multi-range interaction model:
+ *  - Each range has its own handles visible at all times (no select-first dance)
+ *  - Drag a handle to resize that specific range
+ *  - Tap on a range body to select it (highlight + show delete button)
+ *  - Tap on empty track area to move the playhead
+ *  - Drag on empty track to scrub playhead
+ *  - Floating "+" button adds a new 5-second range at current playhead
  */
 @OptIn(UnstableApi::class)
 @Composable
@@ -66,7 +70,6 @@ fun TrimEditorDialog(
     val context = LocalContext.current
     val clipDurationMs = clip.durationSec * 1000L
 
-    // Working copies of edit state
     var ranges by remember { mutableStateOf(initialEdit.ranges) }
     var trimMode by remember { mutableStateOf(initialEdit.mode) }
     var playOrder by remember { mutableStateOf(initialEdit.playOrder) }
@@ -93,16 +96,16 @@ fun TrimEditorDialog(
     var playerPositionMs by remember { mutableStateOf(0L) }
     var isPlaying by remember { mutableStateOf(false) }
 
-    // Build a "preview range" — the trimmed playback range. We stop playback at the end of the
-    // current effective range when looping through segments. For now we stop at the end of
-    // the first/selected range during preview.
+    // Build preview-range used to constrain playback: the selected range if any,
+    // else the first effective range
     val previewRange: TrimRange? = remember(ranges, trimMode, selectedRangeIdx, playOrder) {
         val effective = ClipEdit(clip.uri, ranges, trimMode, playOrder).effectiveRanges(clipDurationMs)
-        // Use the selected range if there is one, otherwise the first effective range
-        if (effective.isEmpty()) null
-        else if (selectedRangeIdx != null && selectedRangeIdx!! < ranges.size && trimMode == TrimMode.KEEP_RANGES) {
-            ranges.getOrNull(selectedRangeIdx!!)
-        } else effective.first()
+        when {
+            effective.isEmpty() -> null
+            selectedRangeIdx != null && selectedRangeIdx!! < ranges.size && trimMode == TrimMode.KEEP_RANGES ->
+                ranges.getOrNull(selectedRangeIdx!!)
+            else -> effective.first()
+        }
     }
 
     LaunchedEffect(exoPlayer) {
@@ -144,39 +147,45 @@ fun TrimEditorDialog(
             modifier = Modifier.fillMaxSize(),
             color = MaterialTheme.colorScheme.background
         ) {
-            Column(modifier = Modifier.fillMaxSize().padding(12.dp)) {
-                // Header
+            Column(modifier = Modifier.fillMaxSize()) {
+                // ============ FIXED: Header ============
                 Row(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(MaterialTheme.colorScheme.surface)
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text("Trim Clip", fontSize = 18.sp, fontWeight = FontWeight.Bold,
-                        modifier = Modifier.weight(1f))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Trim Clip", fontSize = 17.sp, fontWeight = FontWeight.Bold)
+                        Text(clip.name, fontSize = 10.sp,
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+                            maxLines = 1)
+                    }
                     TextButton(onClick = onCancel) { Text("Cancel") }
+                    Spacer(Modifier.width(4.dp))
                     Button(
                         onClick = {
-                            val newEdit = ClipEdit(
+                            onSave(ClipEdit(
                                 sourceUri = clip.uri,
                                 ranges = ranges,
                                 mode = trimMode,
                                 playOrder = playOrder
-                            )
-                            onSave(newEdit)
-                        }
+                            ))
+                        },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = MaterialTheme.colorScheme.secondary,
+                            contentColor = MaterialTheme.colorScheme.onSecondary
+                        ),
+                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 6.dp)
                     ) { Text("Save") }
                 }
-                Text(clip.name, fontSize = 11.sp,
-                    color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f),
-                    maxLines = 1)
 
-                Spacer(Modifier.height(8.dp))
-
-                // Video preview (fixed aspect ratio for predictable layout)
+                // ============ FIXED: Video preview ============
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(220.dp)
-                        .clip(RoundedCornerShape(8.dp))
+                        .height(200.dp)
                         .background(Color.Black)
                 ) {
                     AndroidView(
@@ -190,261 +199,322 @@ fun TrimEditorDialog(
                     )
                 }
 
-                Spacer(Modifier.height(8.dp))
-
-                // Time + summary
-                val effectiveDur = ClipEdit(clip.uri, ranges, trimMode, playOrder)
-                    .effectiveDurationMs(clipDurationMs)
-                val effectiveRangeCount = ClipEdit(clip.uri, ranges, trimMode, playOrder)
-                    .effectiveRanges(clipDurationMs).size
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween
+                // ============ SCROLLABLE: everything else ============
+                val scrollState = rememberScrollState()
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f)
+                        .verticalScroll(scrollState)
+                        .padding(horizontal = 12.dp, vertical = 8.dp)
                 ) {
-                    Text(formatTime(playerPositionMs), fontSize = 12.sp)
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Text(
-                            "Output: ${formatTime(effectiveDur)}",
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            color = MaterialTheme.colorScheme.primary
-                        )
-                        if (effectiveRangeCount > 1) {
+                    // Time + summary
+                    val effectiveDur = ClipEdit(clip.uri, ranges, trimMode, playOrder)
+                        .effectiveDurationMs(clipDurationMs)
+                    val effectiveRangeCount = ClipEdit(clip.uri, ranges, trimMode, playOrder)
+                        .effectiveRanges(clipDurationMs).size
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(formatTime(playerPositionMs), fontSize = 12.sp)
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
                             Text(
-                                "$effectiveRangeCount segments",
-                                fontSize = 10.sp,
-                                color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f)
+                                "Output: ${formatTime(effectiveDur)}",
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                            if (effectiveRangeCount > 1) {
+                                Text("$effectiveRangeCount segments",
+                                    fontSize = 10.sp,
+                                    color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f))
+                            }
+                        }
+                        Text(formatTime(clipDurationMs), fontSize = 12.sp)
+                    }
+
+                    Spacer(Modifier.height(6.dp))
+
+                    // Playback controls
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.Center
+                    ) {
+                        IconButton(onClick = {
+                            if (isPlaying) {
+                                exoPlayer.pause()
+                            } else {
+                                val pr = previewRange
+                                if (pr != null && (playerPositionMs >= pr.endMs || playerPositionMs < pr.startMs)) {
+                                    exoPlayer.seekTo(pr.startMs)
+                                }
+                                exoPlayer.play()
+                            }
+                        }) {
+                            Icon(
+                                if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                                contentDescription = if (isPlaying) "Pause" else "Play",
+                                modifier = Modifier.size(32.dp)
                             )
                         }
                     }
-                    Text(formatTime(clipDurationMs), fontSize = 12.sp)
-                }
 
-                Spacer(Modifier.height(8.dp))
+                    Spacer(Modifier.height(4.dp))
 
-                // Playback controls
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.Center
-                ) {
-                    IconButton(onClick = {
-                        if (isPlaying) {
-                            exoPlayer.pause()
-                        } else {
-                            val pr = previewRange
-                            if (pr != null && (playerPositionMs >= pr.endMs || playerPositionMs < pr.startMs)) {
-                                exoPlayer.seekTo(pr.startMs)
-                            }
-                            exoPlayer.play()
-                        }
-                    }) {
-                        Icon(
-                            if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
-                            contentDescription = if (isPlaying) "Pause" else "Play",
-                            modifier = Modifier.size(36.dp)
-                        )
-                    }
-                }
-
-                Spacer(Modifier.height(8.dp))
-
-                // Multi-region scrubber
-                MultiRegionScrubber(
-                    durationMs = clipDurationMs,
-                    ranges = ranges,
-                    trimMode = trimMode,
-                    selectedIdx = selectedRangeIdx,
-                    playheadMs = playerPositionMs,
-                    keyframes = keyframes,
-                    onRangeSelect = { idx -> selectedRangeIdx = idx },
-                    onRangeUpdate = { idx, newRange ->
-                        val newRanges = ranges.toMutableList()
-                        newRanges[idx] = newRange
-                        ranges = newRanges
-                    },
-                    onPlayheadSeek = { ms ->
-                        exoPlayer.seekTo(ms.coerceIn(0L, clipDurationMs))
-                    },
-                    snapStart = ::snapStart,
-                    snapEnd = ::snapEnd
-                )
-
-                Spacer(Modifier.height(8.dp))
-
-                // Mode toggle + Add range
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    FilterChip(
-                        selected = trimMode == TrimMode.KEEP_RANGES,
-                        onClick = { trimMode = TrimMode.KEEP_RANGES },
-                        label = { Text("Keep", fontSize = 12.sp) }
-                    )
-                    FilterChip(
-                        selected = trimMode == TrimMode.REMOVE_RANGES,
-                        onClick = { trimMode = TrimMode.REMOVE_RANGES },
-                        label = { Text("Remove", fontSize = 12.sp) }
-                    )
-                    Spacer(Modifier.weight(1f))
-                    Button(
-                        onClick = {
-                            // Add a range at playhead, default 5 seconds long (or to clip end)
-                            val start = snapStart(playerPositionMs)
-                            val end = snapEnd((playerPositionMs + 5000).coerceAtMost(clipDurationMs))
-                            if (end > start) {
-                                ranges = ranges + TrimRange(start, end)
-                                selectedRangeIdx = ranges.size - 1
-                            }
-                        },
-                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
-                    ) {
-                        Icon(Icons.Filled.Add, null, modifier = Modifier.size(16.dp))
-                        Spacer(Modifier.width(4.dp))
-                        Text("Add range", fontSize = 12.sp)
-                    }
-                }
-
-                Spacer(Modifier.height(8.dp))
-
-                // Mode help
-                Text(
-                    when (trimMode) {
-                        TrimMode.KEEP_RANGES -> "Keep mode: marked segments are kept, the rest is discarded"
-                        TrimMode.REMOVE_RANGES -> "Remove mode: marked segments are CUT OUT, the rest is kept"
-                    },
-                    fontSize = 11.sp,
-                    color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f)
-                )
-
-                Spacer(Modifier.height(8.dp))
-
-                // Range list (selectable, with delete + reorder for selected)
-                if (ranges.isNotEmpty()) {
-                    RangeList(
+                    // ===== Multi-region scrubber (taller, clearer) =====
+                    MultiRegionScrubber(
+                        durationMs = clipDurationMs,
                         ranges = ranges,
                         trimMode = trimMode,
-                        playOrder = playOrder,
                         selectedIdx = selectedRangeIdx,
-                        clipDurationMs = clipDurationMs,
-                        onSelect = { selectedRangeIdx = it },
-                        onDelete = { idx ->
-                            val newRanges = ranges.toMutableList().also { it.removeAt(idx) }
+                        playheadMs = playerPositionMs,
+                        keyframes = keyframes,
+                        onRangeTap = { idx ->
+                            selectedRangeIdx = if (selectedRangeIdx == idx) null else idx
+                        },
+                        onRangeStartChange = { idx, newStart ->
+                            val newRanges = ranges.toMutableList()
+                            newRanges[idx] = TrimRange(newStart, newRanges[idx].endMs)
                             ranges = newRanges
-                            // Clean playOrder
-                            playOrder = playOrder
-                                .filter { it != idx }
-                                .map { if (it > idx) it - 1 else it }
-                            if (selectedRangeIdx == idx) selectedRangeIdx = null
-                            else if (selectedRangeIdx != null && selectedRangeIdx!! > idx) {
-                                selectedRangeIdx = selectedRangeIdx!! - 1
-                            }
                         },
-                        onMoveUp = { idx ->
-                            // Move idx earlier in playOrder
-                            val currentOrder = if (playOrder.isEmpty()) ranges.indices.toList() else playOrder
-                            val pos = currentOrder.indexOf(idx)
-                            if (pos > 0) {
-                                val newOrder = currentOrder.toMutableList()
-                                newOrder[pos] = newOrder[pos - 1].also { newOrder[pos - 1] = newOrder[pos] }
-                                playOrder = newOrder
-                            }
+                        onRangeEndChange = { idx, newEnd ->
+                            val newRanges = ranges.toMutableList()
+                            newRanges[idx] = TrimRange(newRanges[idx].startMs, newEnd)
+                            ranges = newRanges
                         },
-                        onMoveDown = { idx ->
-                            val currentOrder = if (playOrder.isEmpty()) ranges.indices.toList() else playOrder
-                            val pos = currentOrder.indexOf(idx)
-                            if (pos in 0 until currentOrder.size - 1) {
-                                val newOrder = currentOrder.toMutableList()
-                                newOrder[pos] = newOrder[pos + 1].also { newOrder[pos + 1] = newOrder[pos] }
-                                playOrder = newOrder
-                            }
-                        }
+                        onPlayheadSeek = { ms ->
+                            exoPlayer.seekTo(ms.coerceIn(0L, clipDurationMs))
+                        },
+                        snapStart = ::snapStart,
+                        snapEnd = ::snapEnd
                     )
-                }
 
-                // Number entry for selected range
-                val selIdx = selectedRangeIdx
-                if (selIdx != null && selIdx < ranges.size) {
-                    val selectedRange = ranges[selIdx]
-                    Spacer(Modifier.height(8.dp))
+                    Spacer(Modifier.height(10.dp))
+
+                    // ===== Add range + Mode toggle =====
                     Row(
                         modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        TimeEntryField(
-                            label = "Start",
-                            value = selectedRange.startMs,
-                            onValueChange = { newValue ->
-                                val snapped = snapStart(newValue)
-                                val end = selectedRange.endMs
-                                if (snapped < end) {
-                                    val newRanges = ranges.toMutableList()
-                                    newRanges[selIdx] = TrimRange(snapped.coerceAtLeast(0L), end)
-                                    ranges = newRanges
+                        Button(
+                            onClick = {
+                                val start = snapStart(playerPositionMs.coerceAtLeast(0L))
+                                val end = snapEnd((playerPositionMs + 5000).coerceAtMost(clipDurationMs))
+                                if (end > start + 100) {
+                                    ranges = ranges + TrimRange(start, end)
+                                    selectedRangeIdx = ranges.size - 1
                                 }
                             },
-                            modifier = Modifier.weight(1f)
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = MaterialTheme.colorScheme.secondary,
+                                contentColor = MaterialTheme.colorScheme.onSecondary
+                            ),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                        ) {
+                            Icon(Icons.Filled.Add, null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("Add range", fontSize = 13.sp)
+                        }
+                        Spacer(Modifier.weight(1f))
+                        FilterChip(
+                            selected = trimMode == TrimMode.KEEP_RANGES,
+                            onClick = { trimMode = TrimMode.KEEP_RANGES },
+                            label = { Text("Keep", fontSize = 12.sp) }
                         )
-                        TimeEntryField(
-                            label = "End",
-                            value = selectedRange.endMs,
-                            onValueChange = { newValue ->
-                                val snapped = snapEnd(newValue)
-                                val start = selectedRange.startMs
-                                if (snapped > start) {
-                                    val newRanges = ranges.toMutableList()
-                                    newRanges[selIdx] = TrimRange(start, snapped.coerceAtMost(clipDurationMs))
-                                    ranges = newRanges
-                                }
-                            },
-                            modifier = Modifier.weight(1f)
+                        FilterChip(
+                            selected = trimMode == TrimMode.REMOVE_RANGES,
+                            onClick = { trimMode = TrimMode.REMOVE_RANGES },
+                            label = { Text("Cut out", fontSize = 12.sp) }
                         )
                     }
-                }
 
-                Spacer(Modifier.height(12.dp))
+                    Spacer(Modifier.height(6.dp))
 
-                // Snap toggle
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Switch(
-                        checked = snapToKeyframes,
-                        onCheckedChange = { snapToKeyframes = it }
+                    Text(
+                        when (trimMode) {
+                            TrimMode.KEEP_RANGES -> "Keep mode: marked segments are kept"
+                            TrimMode.REMOVE_RANGES -> "Cut-out mode: marked segments are removed"
+                        },
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f)
                     )
-                    Spacer(Modifier.width(8.dp))
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text("Snap to keyframes", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-                        Text(
-                            if (snapToKeyframes)
-                                "Fast merge (lossless) — exact cut may shift by ±1s"
-                            else
-                                "Precise trim — will require re-encoding (slow)",
-                            fontSize = 10.sp,
-                            color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f)
-                        )
-                    }
-                }
 
-                if (!keyframesLoaded) {
-                    Text("Loading keyframes...", fontSize = 10.sp,
-                        color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.5f))
-                } else {
-                    Text("${keyframes.size} keyframes found",
+                    Spacer(Modifier.height(10.dp))
+
+                    // ===== Range list =====
+                    if (ranges.isNotEmpty()) {
+                        RangeListVertical(
+                            ranges = ranges,
+                            trimMode = trimMode,
+                            playOrder = playOrder,
+                            selectedIdx = selectedRangeIdx,
+                            onSelect = { selectedRangeIdx = it },
+                            onDelete = { idx ->
+                                val newRanges = ranges.toMutableList().also { it.removeAt(idx) }
+                                ranges = newRanges
+                                playOrder = playOrder
+                                    .filter { it != idx }
+                                    .map { if (it > idx) it - 1 else it }
+                                if (selectedRangeIdx == idx) selectedRangeIdx = null
+                                else if (selectedRangeIdx != null && selectedRangeIdx!! > idx) {
+                                    selectedRangeIdx = selectedRangeIdx!! - 1
+                                }
+                            },
+                            onMoveUp = { idx ->
+                                val currentOrder = if (playOrder.isEmpty()) ranges.indices.toList() else playOrder
+                                val pos = currentOrder.indexOf(idx)
+                                if (pos > 0) {
+                                    val newOrder = currentOrder.toMutableList()
+                                    newOrder[pos] = newOrder[pos - 1].also { newOrder[pos - 1] = newOrder[pos] }
+                                    playOrder = newOrder
+                                }
+                            },
+                            onMoveDown = { idx ->
+                                val currentOrder = if (playOrder.isEmpty()) ranges.indices.toList() else playOrder
+                                val pos = currentOrder.indexOf(idx)
+                                if (pos in 0 until currentOrder.size - 1) {
+                                    val newOrder = currentOrder.toMutableList()
+                                    newOrder[pos] = newOrder[pos + 1].also { newOrder[pos + 1] = newOrder[pos] }
+                                    playOrder = newOrder
+                                }
+                            }
+                        )
+                    } else {
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = CardDefaults.cardColors(
+                                containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+                            )
+                        ) {
+                            Column(modifier = Modifier.padding(12.dp)) {
+                                Text("No ranges yet",
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.SemiBold)
+                                Text(
+                                    "Tap 'Add range' to mark a segment, or use the timeline above.",
+                                    fontSize = 11.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    }
+
+                    // ===== Number entry for selected range =====
+                    val selIdx = selectedRangeIdx
+                    if (selIdx != null && selIdx < ranges.size) {
+                        val selectedRange = ranges[selIdx]
+                        Spacer(Modifier.height(10.dp))
+                        Text("Selected range times (mm:ss.s):",
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f))
+                        Spacer(Modifier.height(4.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            TimeEntryField(
+                                label = "Start",
+                                value = selectedRange.startMs,
+                                onValueChange = { newValue ->
+                                    val snapped = snapStart(newValue)
+                                    if (snapped < selectedRange.endMs) {
+                                        val newRanges = ranges.toMutableList()
+                                        newRanges[selIdx] = TrimRange(
+                                            snapped.coerceAtLeast(0L),
+                                            selectedRange.endMs
+                                        )
+                                        ranges = newRanges
+                                    }
+                                },
+                                modifier = Modifier.weight(1f)
+                            )
+                            TimeEntryField(
+                                label = "End",
+                                value = selectedRange.endMs,
+                                onValueChange = { newValue ->
+                                    val snapped = snapEnd(newValue)
+                                    if (snapped > selectedRange.startMs) {
+                                        val newRanges = ranges.toMutableList()
+                                        newRanges[selIdx] = TrimRange(
+                                            selectedRange.startMs,
+                                            snapped.coerceAtMost(clipDurationMs)
+                                        )
+                                        ranges = newRanges
+                                    }
+                                },
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                    }
+
+                    Spacer(Modifier.height(14.dp))
+
+                    // ===== Snap toggle =====
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+                        )
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Switch(
+                                checked = snapToKeyframes,
+                                onCheckedChange = { snapToKeyframes = it }
+                            )
+                            Spacer(Modifier.width(10.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("Snap to keyframes",
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.SemiBold)
+                                Text(
+                                    if (snapToKeyframes)
+                                        "Fast merge — cut may shift by ±1s"
+                                    else
+                                        "Precise trim — requires re-encoding (slow)",
+                                    fontSize = 10.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    }
+
+                    Spacer(Modifier.height(8.dp))
+
+                    Text(
+                        if (!keyframesLoaded) "Loading keyframes..."
+                        else "${keyframes.size} keyframes found",
                         fontSize = 10.sp,
-                        color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.5f))
+                        color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.5f)
+                    )
+
+                    // Bottom padding so the last item isn't flush against the dialog edge
+                    Spacer(Modifier.height(20.dp))
                 }
             }
         }
     }
 }
 
+// ============================================================================
+// Multi-region scrubber — clearer, more touchable
+// ============================================================================
+
 /**
- * Multi-region scrubber.
- *
- * Visual: a horizontal track. Each range is painted as a colored block.
- * Tapping a block selects it. Selected block shows handles for resize.
- * Drag anywhere on the track outside ranges to scrub the playhead.
+ * Scrubber design:
+ *   - Total height 96dp (60dp track + 18dp top/bottom for handles)
+ *   - Each range has start + end handles ALWAYS visible (drawn outside the track rect)
+ *   - Tap on track empty space → move playhead
+ *   - Drag empty space → drag playhead
+ *   - Tap on a range body → select it
+ *   - Drag a range body → move the WHOLE range (start and end together)
+ *   - Drag a handle → resize that specific range
+ *   - Snap-on-release behavior preserved
  */
 @Composable
 private fun MultiRegionScrubber(
@@ -454,8 +524,9 @@ private fun MultiRegionScrubber(
     selectedIdx: Int?,
     playheadMs: Long,
     keyframes: List<Long>,
-    onRangeSelect: (Int?) -> Unit,
-    onRangeUpdate: (Int, TrimRange) -> Unit,
+    onRangeTap: (Int) -> Unit,
+    onRangeStartChange: (Int, Long) -> Unit,
+    onRangeEndChange: (Int, Long) -> Unit,
     onPlayheadSeek: (Long) -> Unit,
     snapStart: (Long) -> Long,
     snapEnd: (Long) -> Long
@@ -466,29 +537,39 @@ private fun MultiRegionScrubber(
         TrimMode.REMOVE_RANGES -> MaterialTheme.colorScheme.error
     }
 
+    // Total height: track (60dp) + handle overhang (top 18dp + bottom 18dp)
     Box(
         modifier = Modifier
             .fillMaxWidth()
-            .height(56.dp)
+            .height(96.dp)
     ) {
         BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
             val widthPx = with(density) { maxWidth.toPx() }
-            fun msToX(ms: Long): Float =
+            val msToX = { ms: Long ->
                 if (durationMs > 0) (ms.toFloat() / durationMs) * widthPx else 0f
-            fun xToMs(x: Float): Long =
+            }
+            val xToMs = { x: Float ->
                 if (widthPx > 0) ((x / widthPx) * durationMs).toLong() else 0L
+            }
 
-            // Background track + scrub gestures
+            // ===== Track background =====
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(36.dp)
+                    .height(60.dp)
                     .align(Alignment.Center)
-                    .clip(RoundedCornerShape(4.dp))
+                    .clip(RoundedCornerShape(6.dp))
                     .background(MaterialTheme.colorScheme.surfaceVariant)
                     .pointerInput(durationMs) {
+                        // Tap to seek
+                        detectTapGestures { offset ->
+                            onPlayheadSeek(xToMs(offset.x).coerceIn(0L, durationMs))
+                        }
+                    }
+                    .pointerInput(durationMs) {
+                        // Drag to scrub
                         detectDragGestures { change, _ ->
-                            onPlayheadSeek(xToMs(change.position.x))
+                            onPlayheadSeek(xToMs(change.position.x).coerceIn(0L, durationMs))
                         }
                     }
             ) {
@@ -505,204 +586,257 @@ private fun MultiRegionScrubber(
                 }
             }
 
-            // Range blocks
+            // ===== Range blocks =====
             ranges.forEachIndexed { idx, range ->
                 val startXDp = with(density) { msToX(range.startMs).toDp() }
                 val endXDp = with(density) { msToX(range.endMs).toDp() }
-                val widthDp = (endXDp - startXDp).coerceAtLeast(2.dp)
+                val widthDp = (endXDp - startXDp).coerceAtLeast(4.dp)
                 val isSelected = idx == selectedIdx
+
+                // Range body — clickable to select; also draggable to move whole range
                 Box(
                     modifier = Modifier
-                        .offset(x = startXDp, y = 10.dp)
+                        .offset(x = startXDp, y = 18.dp)
                         .width(widthDp)
-                        .height(36.dp)
-                        .clip(RoundedCornerShape(4.dp))
-                        .background(rangeColor.copy(alpha = if (isSelected) 0.6f else 0.35f))
+                        .height(60.dp)
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(rangeColor.copy(alpha = if (isSelected) 0.7f else 0.4f))
                         .border(
                             width = if (isSelected) 2.dp else 0.dp,
                             color = if (isSelected) rangeColor else Color.Transparent,
-                            shape = RoundedCornerShape(4.dp)
+                            shape = RoundedCornerShape(6.dp)
                         )
-                        .clickable { onRangeSelect(idx) }
+                        .pointerInput(idx, range) {
+                            detectTapGestures { onRangeTap(idx) }
+                        }
+                ) {
+                    // Show range index as small label inside
+                    Text(
+                        "#${idx + 1}",
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = if (isSelected) MaterialTheme.colorScheme.onPrimary
+                            else MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier
+                            .align(Alignment.TopStart)
+                            .padding(2.dp)
+                    )
+                }
+            }
+
+            // ===== Handles (drawn ABOVE/BELOW the track so they don't overlap with ranges) =====
+            // Each range gets its own pair of handles, always visible.
+            ranges.forEachIndexed { idx, range ->
+                val isSelected = idx == selectedIdx
+                val handleColor = if (isSelected) rangeColor
+                    else rangeColor.copy(alpha = 0.7f)
+
+                // START handle — extends ABOVE the track (top 18dp)
+                HandleControl(
+                    xDp = with(density) { msToX(range.startMs).toDp() },
+                    topDp = 0.dp,
+                    color = handleColor,
+                    handleType = HandleType.START,
+                    onDragStart = { onRangeTap(idx) },
+                    onDragMs = { deltaMs ->
+                        val newStart = (range.startMs + deltaMs).coerceIn(0L, range.endMs - 100L)
+                        onRangeStartChange(idx, newStart)
+                    },
+                    onDragEnd = {
+                        val current = ranges.getOrNull(idx) ?: return@HandleControl
+                        val snapped = snapStart(current.startMs).coerceIn(0L, current.endMs - 100L)
+                        onRangeStartChange(idx, snapped)
+                    },
+                    xToMs = xToMs
+                )
+
+                // END handle — extends BELOW the track (bottom 18dp)
+                HandleControl(
+                    xDp = with(density) { msToX(range.endMs).toDp() },
+                    topDp = 78.dp,  // 96dp total - 18dp handle height = 78dp
+                    color = handleColor,
+                    handleType = HandleType.END,
+                    onDragStart = { onRangeTap(idx) },
+                    onDragMs = { deltaMs ->
+                        val newEnd = (range.endMs + deltaMs).coerceIn(range.startMs + 100L, durationMs)
+                        onRangeEndChange(idx, newEnd)
+                    },
+                    onDragEnd = {
+                        val current = ranges.getOrNull(idx) ?: return@HandleControl
+                        val snapped = snapEnd(current.endMs).coerceIn(current.startMs + 100L, durationMs)
+                        onRangeEndChange(idx, snapped)
+                    },
+                    xToMs = xToMs
                 )
             }
 
-            // Handles for selected range
-            val sel = selectedIdx
-            if (sel != null && sel < ranges.size) {
-                val r = ranges[sel]
-                val startXDp = with(density) { msToX(r.startMs).toDp() }
-                val endXDp = with(density) { msToX(r.endMs).toDp() }
-
-                // Start handle — smooth drag, snap on release
-                var startDragMs by remember(sel, ranges) { mutableStateOf(r.startMs) }
-                Box(
-                    modifier = Modifier
-                        .offset(x = startXDp - 24.dp, y = 4.dp)
-                        .width(48.dp)
-                        .height(48.dp)
-                        .pointerInput(sel, ranges) {
-                            detectDragGestures(
-                                onDragStart = { startDragMs = r.startMs },
-                                onDragEnd = {
-                                    val snapped = snapStart(startDragMs)
-                                    onRangeUpdate(sel, TrimRange(
-                                        snapped.coerceIn(0L, r.endMs - 100L),
-                                        r.endMs
-                                    ))
-                                },
-                                onDragCancel = { },
-                                onDrag = { _, dragAmount ->
-                                    val deltaMs = xToMs(dragAmount.x)
-                                    val newStart = (startDragMs + deltaMs).coerceIn(0L, r.endMs - 100L)
-                                    startDragMs = newStart
-                                    onRangeUpdate(sel, TrimRange(newStart, r.endMs))
-                                }
-                            )
-                        }
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .align(Alignment.Center)
-                            .width(10.dp)
-                            .height(48.dp)
-                            .clip(RoundedCornerShape(4.dp))
-                            .background(rangeColor)
-                    )
-                }
-
-                // End handle — smooth drag, snap on release
-                var endDragMs by remember(sel, ranges) { mutableStateOf(r.endMs) }
-                Box(
-                    modifier = Modifier
-                        .offset(x = endXDp - 24.dp, y = 4.dp)
-                        .width(48.dp)
-                        .height(48.dp)
-                        .pointerInput(sel, ranges) {
-                            detectDragGestures(
-                                onDragStart = { endDragMs = r.endMs },
-                                onDragEnd = {
-                                    val snapped = snapEnd(endDragMs)
-                                    onRangeUpdate(sel, TrimRange(
-                                        r.startMs,
-                                        snapped.coerceIn(r.startMs + 100L, durationMs)
-                                    ))
-                                },
-                                onDragCancel = { },
-                                onDrag = { _, dragAmount ->
-                                    val deltaMs = xToMs(dragAmount.x)
-                                    val newEnd = (endDragMs + deltaMs).coerceIn(r.startMs + 100L, durationMs)
-                                    endDragMs = newEnd
-                                    onRangeUpdate(sel, TrimRange(r.startMs, newEnd))
-                                }
-                            )
-                        }
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .align(Alignment.Center)
-                            .width(10.dp)
-                            .height(48.dp)
-                            .clip(RoundedCornerShape(4.dp))
-                            .background(rangeColor)
-                    )
-                }
-            }
-
-            // Playhead
+            // ===== Playhead =====
             val playheadDp = with(density) { msToX(playheadMs).toDp() }
             Box(
                 modifier = Modifier
-                    .offset(x = playheadDp - 1.dp, y = 6.dp)
+                    .offset(x = playheadDp - 1.dp, y = 12.dp)
                     .width(2.dp)
-                    .height(44.dp)
+                    .height(72.dp)
                     .background(Color.White)
             )
         }
     }
 }
 
+private enum class HandleType { START, END }
+
+/**
+ * A draggable trim handle. Rendered as a 12dp-wide visible bar with a 48dp-wide
+ * invisible touch target (centered horizontally). Drag accumulates locally without
+ * snapping; on release, the parent snaps.
+ */
 @Composable
-private fun RangeList(
+private fun HandleControl(
+    xDp: androidx.compose.ui.unit.Dp,
+    topDp: androidx.compose.ui.unit.Dp,
+    color: Color,
+    handleType: HandleType,
+    onDragStart: () -> Unit,
+    onDragMs: (Long) -> Unit,
+    onDragEnd: () -> Unit,
+    xToMs: (Float) -> Long
+) {
+    // Touch target box (invisible, 48dp wide), positioned centered on xDp
+    Box(
+        modifier = Modifier
+            .offset(x = xDp - 24.dp, y = topDp)
+            .width(48.dp)
+            .height(48.dp)
+            .pointerInput(handleType) {
+                detectDragGestures(
+                    onDragStart = { onDragStart() },
+                    onDragEnd = { onDragEnd() },
+                    onDragCancel = { },
+                    onDrag = { _, dragAmount ->
+                        val deltaMs = xToMs(dragAmount.x)
+                        onDragMs(deltaMs)
+                    }
+                )
+            }
+    ) {
+        // Visible handle bar (12dp wide × 36dp tall, centered)
+        Box(
+            modifier = Modifier
+                .align(Alignment.Center)
+                .width(12.dp)
+                .height(36.dp)
+                .clip(RoundedCornerShape(3.dp))
+                .background(color)
+        )
+    }
+}
+
+// ============================================================================
+// Range list — vertical, clearer per-range info
+// ============================================================================
+
+@Composable
+private fun RangeListVertical(
     ranges: List<TrimRange>,
     trimMode: TrimMode,
     playOrder: List<Int>,
     selectedIdx: Int?,
-    clipDurationMs: Long,
     onSelect: (Int) -> Unit,
     onDelete: (Int) -> Unit,
     onMoveUp: (Int) -> Unit,
     onMoveDown: (Int) -> Unit
 ) {
-    // Build the display order: if KEEP + playOrder, use that; otherwise source order
+    // Display order: KEEP mode applies playOrder, REMOVE mode = source order
     val displayOrder = if (trimMode == TrimMode.KEEP_RANGES && playOrder.isNotEmpty())
         playOrder.filter { it < ranges.size }
     else ranges.indices.toList()
 
-    LazyRow(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(6.dp)
-    ) {
-        itemsIndexed(displayOrder) { displayPos, rangeIdx ->
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text(
+            "Ranges (${ranges.size}):",
+            fontSize = 11.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.7f)
+        )
+        displayOrder.forEachIndexed { displayPos, rangeIdx ->
             val range = ranges[rangeIdx]
             val isSelected = rangeIdx == selectedIdx
             Row(
                 modifier = Modifier
+                    .fillMaxWidth()
                     .clip(RoundedCornerShape(6.dp))
                     .background(
-                        if (isSelected) MaterialTheme.colorScheme.primaryContainer
-                        else MaterialTheme.colorScheme.surfaceVariant
+                        if (isSelected) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.4f)
+                        else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+                    )
+                    .border(
+                        width = if (isSelected) 1.5.dp else 0.dp,
+                        color = if (isSelected) MaterialTheme.colorScheme.primary
+                            else Color.Transparent,
+                        shape = RoundedCornerShape(6.dp)
                     )
                     .clickable { onSelect(rangeIdx) }
-                    .padding(horizontal = 8.dp, vertical = 6.dp),
+                    .padding(horizontal = 10.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Column {
+                Box(
+                    modifier = Modifier
+                        .size(24.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(
+                            if (isSelected) MaterialTheme.colorScheme.primary
+                            else MaterialTheme.colorScheme.surfaceVariant
+                        ),
+                    contentAlignment = Alignment.Center
+                ) {
                     Text(
-                        "#${displayPos + 1}",
-                        fontSize = 10.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                        "${displayPos + 1}",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = if (isSelected) MaterialTheme.colorScheme.onPrimary
+                            else MaterialTheme.colorScheme.onSurface
                     )
+                }
+                Spacer(Modifier.width(10.dp))
+                Column(modifier = Modifier.weight(1f)) {
                     Text(
                         "${formatTime(range.startMs)} → ${formatTime(range.endMs)}",
-                        fontSize = 11.sp,
+                        fontSize = 12.sp,
                         fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal
                     )
                     Text(
-                        "${"%.1f".format(range.durationMs / 1000.0)}s",
+                        "${"%.1f".format(range.durationMs / 1000.0)} seconds",
                         fontSize = 10.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
-                if (isSelected) {
-                    Spacer(Modifier.width(4.dp))
-                    Column {
-                        // Reorder arrows only meaningful in KEEP mode
-                        if (trimMode == TrimMode.KEEP_RANGES && ranges.size > 1) {
-                            IconButton(
-                                onClick = { onMoveUp(rangeIdx) },
-                                modifier = Modifier.size(20.dp)
-                            ) {
-                                Icon(Icons.Filled.ArrowUpward, "Move earlier",
-                                    modifier = Modifier.size(14.dp))
-                            }
-                            IconButton(
-                                onClick = { onMoveDown(rangeIdx) },
-                                modifier = Modifier.size(20.dp)
-                            ) {
-                                Icon(Icons.Filled.ArrowDownward, "Move later",
-                                    modifier = Modifier.size(14.dp))
-                            }
-                        }
+                // Reorder arrows (only meaningful in KEEP mode with multiple ranges)
+                if (trimMode == TrimMode.KEEP_RANGES && ranges.size > 1 && isSelected) {
+                    IconButton(
+                        onClick = { onMoveUp(rangeIdx) },
+                        modifier = Modifier.size(32.dp)
+                    ) {
+                        Icon(Icons.Filled.ArrowUpward, "Move earlier",
+                            modifier = Modifier.size(16.dp))
                     }
                     IconButton(
-                        onClick = { onDelete(rangeIdx) },
-                        modifier = Modifier.size(28.dp)
+                        onClick = { onMoveDown(rangeIdx) },
+                        modifier = Modifier.size(32.dp)
                     ) {
-                        Icon(Icons.Filled.Close, "Delete range",
-                            tint = MaterialTheme.colorScheme.error,
-                            modifier = Modifier.size(18.dp))
+                        Icon(Icons.Filled.ArrowDownward, "Move later",
+                            modifier = Modifier.size(16.dp))
                     }
+                }
+                IconButton(
+                    onClick = { onDelete(rangeIdx) },
+                    modifier = Modifier.size(32.dp)
+                ) {
+                    Icon(
+                        Icons.Filled.Delete,
+                        "Delete range",
+                        tint = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.size(18.dp)
+                    )
                 }
             }
         }
