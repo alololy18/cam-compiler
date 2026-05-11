@@ -60,6 +60,7 @@ fun TrimEditorDialog(
     clip: VideoClip,
     initialEdit: ClipEdit,
     onSave: (ClipEdit) -> Unit,
+    onExport: (ClipEdit) -> Unit,
     onCancel: () -> Unit
 ) {
     val context = LocalContext.current
@@ -69,6 +70,9 @@ fun TrimEditorDialog(
     var trimMode by remember { mutableStateOf(initialEdit.mode) }
     var playOrder by remember { mutableStateOf(initialEdit.playOrder) }
     var selectedRangeIdx by remember { mutableStateOf<Int?>(null) }
+
+    // Export preview state: when true, we're in the preview-before-commit overlay
+    var showExportPreview by remember { mutableStateOf(false) }
 
     var snapToKeyframes by remember { mutableStateOf(true) }
     var keyframes by remember { mutableStateOf<List<Long>>(emptyList()) }
@@ -140,6 +144,7 @@ fun TrimEditorDialog(
             modifier = Modifier.fillMaxSize(),
             color = MaterialTheme.colorScheme.background
         ) {
+            Box(modifier = Modifier.fillMaxSize()) {
             Column(modifier = Modifier.fillMaxSize()) {
                 // ============ FIXED: Header ============
                 Row(
@@ -156,8 +161,8 @@ fun TrimEditorDialog(
                             maxLines = 1)
                     }
                     TextButton(onClick = onCancel) { Text("Cancel") }
-                    Spacer(Modifier.width(4.dp))
-                    Button(
+                    Spacer(Modifier.width(2.dp))
+                    OutlinedButton(
                         onClick = {
                             onSave(ClipEdit(
                                 sourceUri = clip.uri,
@@ -166,12 +171,22 @@ fun TrimEditorDialog(
                                 playOrder = playOrder
                             ))
                         },
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                    ) { Text("Save", fontSize = 13.sp) }
+                    Spacer(Modifier.width(2.dp))
+                    Button(
+                        onClick = {
+                            // Pause player and switch to preview overlay
+                            exoPlayer.pause()
+                            showExportPreview = true
+                        },
+                        enabled = ranges.isNotEmpty(),
                         colors = ButtonDefaults.buttonColors(
                             containerColor = MaterialTheme.colorScheme.secondary,
                             contentColor = MaterialTheme.colorScheme.onSecondary
                         ),
-                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 6.dp)
-                    ) { Text("Save") }
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                    ) { Text("Export", fontSize = 13.sp) }
                 }
 
                 // ============ FIXED: Video preview ============
@@ -262,7 +277,21 @@ fun TrimEditorDialog(
                         playheadMs = playerPositionMs,
                         keyframes = keyframes,
                         onRangeTap = { idx ->
-                            selectedRangeIdx = if (selectedRangeIdx == idx) null else idx
+                            // Toggle selection. If newly selecting, seek preview to range start.
+                            val newSel = if (selectedRangeIdx == idx) null else idx
+                            selectedRangeIdx = newSel
+                            if (newSel != null) {
+                                ranges.getOrNull(newSel)?.let { r ->
+                                    exoPlayer.seekTo(r.startMs)
+                                }
+                            }
+                        },
+                        onRangeSelect = { idx ->
+                            // Always select (don't toggle off) and seek preview
+                            selectedRangeIdx = idx
+                            ranges.getOrNull(idx)?.let { r ->
+                                exoPlayer.seekTo(r.startMs)
+                            }
                         },
                         onRangeStartCommit = { idx, finalMs ->
                             val newRanges = ranges.toMutableList()
@@ -293,10 +322,10 @@ fun TrimEditorDialog(
                     ) {
                         Button(
                             onClick = {
-                                // New range starts after the last range ends.
-                                // Fall back to playhead position if no ranges yet.
+                                // New range starts after the last range ends, with a small gap
+                                // so the handles don't sit directly on top of each other.
                                 val startPoint = if (ranges.isNotEmpty()) {
-                                    ranges.maxOf { it.endMs }
+                                    (ranges.maxOf { it.endMs } + 200L).coerceAtMost(clipDurationMs - 100L)
                                 } else {
                                     playerPositionMs.coerceAtLeast(0L)
                                 }
@@ -307,7 +336,6 @@ fun TrimEditorDialog(
                                 if (end > start + 100) {
                                     ranges = ranges + TrimRange(start, end)
                                     selectedRangeIdx = ranges.size - 1
-                                    // Jump preview to the new range
                                     exoPlayer.seekTo(start)
                                 }
                             },
@@ -492,6 +520,21 @@ fun TrimEditorDialog(
                     Spacer(Modifier.height(20.dp))
                 }
             }
+
+            // Export preview overlay — covers the editor body
+            if (showExportPreview) {
+                ExportPreviewOverlay(
+                    clip = clip,
+                    edit = ClipEdit(clip.uri, ranges, trimMode, playOrder),
+                    onConfirm = {
+                        val finalEdit = ClipEdit(clip.uri, ranges, trimMode, playOrder)
+                        showExportPreview = false
+                        onExport(finalEdit)
+                    },
+                    onBack = { showExportPreview = false }
+                )
+            }
+            }
         }
     }
 }
@@ -541,6 +584,7 @@ private fun MultiRegionScrubber(
     playheadMs: Long,
     keyframes: List<Long>,
     onRangeTap: (Int) -> Unit,
+    onRangeSelect: (Int) -> Unit,
     onRangeStartCommit: (Int, Long) -> Unit,
     onRangeEndCommit: (Int, Long) -> Unit,
     onPlayheadSeek: (Long) -> Unit
@@ -609,6 +653,7 @@ private fun MultiRegionScrubber(
                     xToMs = xToMs,
                     density = density,
                     onTap = { onRangeTap(idx) },
+                    onSelectOnly = { onRangeSelect(idx) },
                     onStartCommit = { finalMs -> onRangeStartCommit(idx, finalMs) },
                     onEndCommit = { finalMs -> onRangeEndCommit(idx, finalMs) }
                 )
@@ -628,15 +673,17 @@ private fun MultiRegionScrubber(
 }
 
 /**
- * A single range + its two handles. Owns LOCAL drag state so the drag motion
- * follows the finger without fighting parent state updates.
+ * A single range + its two handles.
  *
- * Architecture:
+ * Architecture (offset-based drag):
  *  - rangeStartMs / rangeEndMs (props) = source of truth from parent
- *  - localStartMs / localEndMs (local state) = where this range is being dragged TO
- *    During drag, the local state is updated continuously and is what's rendered.
- *  - On drag end: local state is committed to parent via onStartCommit / onEndCommit
- *  - When NOT dragging, local state is kept in sync with props via LaunchedEffect
+ *  - During drag, only an OFFSET is accumulated locally (startDragOffsetMs / endDragOffsetMs)
+ *  - Render position = prop + offset (or just prop when not dragging)
+ *  - On drag end: commit absolute value (prop + offset) and clear offset.
+ *    Parent recomposes with new prop, render returns to prop directly.
+ *
+ * This avoids the "stale closure" bug where local state could go out of sync
+ * with props during reselection or reorder.
  */
 @Composable
 private fun RangeWithHandles(
@@ -650,32 +697,31 @@ private fun RangeWithHandles(
     xToMs: (Float) -> Long,
     density: androidx.compose.ui.unit.Density,
     onTap: () -> Unit,
+    onSelectOnly: () -> Unit,
     onStartCommit: (Long) -> Unit,
     onEndCommit: (Long) -> Unit
 ) {
-    // Local drag state — drives rendering during drag
-    var localStartMs by remember(rangeIdx) { mutableStateOf(rangeStartMs) }
-    var localEndMs by remember(rangeIdx) { mutableStateOf(rangeEndMs) }
-    var startDragging by remember(rangeIdx) { mutableStateOf(false) }
-    var endDragging by remember(rangeIdx) { mutableStateOf(false) }
+    // Drag offset model: null when not dragging, accumulated delta when dragging.
+    // Rendering position = props + offset.
+    // After drag end, we commit absolute value and clear offset; parent recomposes
+    // with new props, and rendering returns to using props directly.
+    var startDragOffsetMs by remember { mutableStateOf<Long?>(null) }
+    var endDragOffsetMs by remember { mutableStateOf<Long?>(null) }
 
-    // When NOT dragging, sync local state with props (handles external updates)
-    LaunchedEffect(rangeStartMs, startDragging) {
-        if (!startDragging) localStartMs = rangeStartMs
-    }
-    LaunchedEffect(rangeEndMs, endDragging) {
-        if (!endDragging) localEndMs = rangeEndMs
-    }
+    // Compute render positions
+    val renderStartMs = if (startDragOffsetMs != null) {
+        (rangeStartMs + startDragOffsetMs!!).coerceIn(0L, rangeEndMs - 100L)
+    } else rangeStartMs
 
-    // Use local state for rendering when dragging, props otherwise
-    val renderStartMs = if (startDragging) localStartMs else rangeStartMs
-    val renderEndMs = if (endDragging) localEndMs else rangeEndMs
+    val renderEndMs = if (endDragOffsetMs != null) {
+        (rangeEndMs + endDragOffsetMs!!).coerceIn(renderStartMs + 100L, durationMs)
+    } else rangeEndMs
 
     val startXDp = with(density) { msToX(renderStartMs).toDp() }
     val endXDp = with(density) { msToX(renderEndMs).toDp() }
     val widthDp = (endXDp - startXDp).coerceAtLeast(4.dp)
 
-    // Range body (in center band, 60dp tall, offset y=18 so handles can extend above/below)
+    // Range body — tap to select (toggles selection)
     Box(
         modifier = Modifier
             .offset(x = startXDp, y = 18.dp)
@@ -710,19 +756,18 @@ private fun RangeWithHandles(
         color = color,
         isStartHandle = true,
         onDragStart = {
-            startDragging = true
-            localStartMs = rangeStartMs
-            onTap() // also select this range when dragging starts
+            startDragOffsetMs = 0L
+            onSelectOnly()  // select range without toggling
         },
         onDragDelta = { deltaPx ->
             val deltaMs = xToMs(deltaPx)
-            // Constrain: don't cross the (current) end, don't go negative
-            val proposed = localStartMs + deltaMs
-            localStartMs = proposed.coerceIn(0L, renderEndMs - 100L)
+            val current = startDragOffsetMs ?: 0L
+            startDragOffsetMs = current + deltaMs
         },
         onDragEndCommit = {
-            startDragging = false
-            onStartCommit(localStartMs)
+            val finalOffset = startDragOffsetMs ?: 0L
+            startDragOffsetMs = null
+            onStartCommit(rangeStartMs + finalOffset)
         }
     )
 
@@ -733,18 +778,18 @@ private fun RangeWithHandles(
         color = color,
         isStartHandle = false,
         onDragStart = {
-            endDragging = true
-            localEndMs = rangeEndMs
-            onTap()
+            endDragOffsetMs = 0L
+            onSelectOnly()
         },
         onDragDelta = { deltaPx ->
             val deltaMs = xToMs(deltaPx)
-            val proposed = localEndMs + deltaMs
-            localEndMs = proposed.coerceIn(renderStartMs + 100L, durationMs)
+            val current = endDragOffsetMs ?: 0L
+            endDragOffsetMs = current + deltaMs
         },
         onDragEndCommit = {
-            endDragging = false
-            onEndCommit(localEndMs)
+            val finalOffset = endDragOffsetMs ?: 0L
+            endDragOffsetMs = null
+            onEndCommit(rangeEndMs + finalOffset)
         }
     )
 }
@@ -916,6 +961,221 @@ private fun TimeEntryField(
         singleLine = true,
         modifier = modifier
     )
+}
+
+// ============================================================================
+// Export preview overlay — walks through effective ranges sequentially
+// ============================================================================
+
+/**
+ * Full-screen overlay that plays each effective range one after the other,
+ * showing the user exactly what the export will contain. User then confirms
+ * or goes back to editing.
+ */
+@OptIn(UnstableApi::class)
+@Composable
+private fun ExportPreviewOverlay(
+    clip: VideoClip,
+    edit: ClipEdit,
+    onConfirm: () -> Unit,
+    onBack: () -> Unit
+) {
+    val context = LocalContext.current
+    val clipDurationMs = clip.durationSec * 1000L
+    val effectiveRanges = remember(edit) { edit.effectiveRanges(clipDurationMs) }
+    val totalDurationMs = effectiveRanges.sumOf { it.durationMs }
+
+    // The preview is "playing through" — we track which range is currently playing
+    var currentRangeIdx by remember { mutableStateOf(0) }
+    var isPlaying by remember { mutableStateOf(true) }
+
+    val previewPlayer = remember {
+        ExoPlayer.Builder(context).build().apply {
+            setMediaItem(MediaItem.fromUri(clip.uri))
+            prepare()
+            playWhenReady = true
+        }
+    }
+
+    // Seek to the first range when overlay opens
+    LaunchedEffect(Unit) {
+        if (effectiveRanges.isNotEmpty()) {
+            previewPlayer.seekTo(effectiveRanges[0].startMs)
+            previewPlayer.play()
+        }
+    }
+
+    // Monitor playback: when current range ends, advance to next or stop
+    LaunchedEffect(previewPlayer, effectiveRanges) {
+        while (true) {
+            isPlaying = previewPlayer.isPlaying
+            if (effectiveRanges.isNotEmpty() && currentRangeIdx < effectiveRanges.size) {
+                val r = effectiveRanges[currentRangeIdx]
+                if (previewPlayer.currentPosition >= r.endMs && previewPlayer.isPlaying) {
+                    // Move to next range
+                    val next = currentRangeIdx + 1
+                    if (next < effectiveRanges.size) {
+                        currentRangeIdx = next
+                        previewPlayer.seekTo(effectiveRanges[next].startMs)
+                    } else {
+                        // End of preview
+                        previewPlayer.pause()
+                        previewPlayer.seekTo(effectiveRanges[0].startMs)
+                        currentRangeIdx = 0
+                    }
+                }
+            }
+            delay(50)
+        }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose { previewPlayer.release() }
+    }
+
+    Surface(
+        modifier = Modifier.fillMaxSize(),
+        color = MaterialTheme.colorScheme.background
+    ) {
+        Column(modifier = Modifier.fillMaxSize()) {
+            // Header
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(MaterialTheme.colorScheme.surface)
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Preview Export", fontSize = 17.sp, fontWeight = FontWeight.Bold)
+                    Text(
+                        "${effectiveRanges.size} segment(s)  •  ${formatTime(totalDurationMs)} total",
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
+                    )
+                }
+                TextButton(onClick = onBack) { Text("Back to edit") }
+            }
+
+            // Video preview
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(280.dp)
+                    .background(Color.Black)
+            ) {
+                AndroidView(
+                    factory = { ctx ->
+                        PlayerView(ctx).apply {
+                            player = previewPlayer
+                            useController = false
+                        }
+                    },
+                    modifier = Modifier.fillMaxSize()
+                )
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            // Currently playing segment indicator
+            Column(modifier = Modifier.padding(horizontal = 16.dp)) {
+                Text(
+                    "Now playing: Segment ${(currentRangeIdx + 1).coerceAtMost(effectiveRanges.size)} of ${effectiveRanges.size}",
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                if (currentRangeIdx < effectiveRanges.size) {
+                    val r = effectiveRanges[currentRangeIdx]
+                    Text(
+                        "${formatTime(r.startMs)} → ${formatTime(r.endMs)}  (${"%.1f".format(r.durationMs / 1000.0)}s)",
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f)
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            // Playback controls
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.Center
+            ) {
+                IconButton(onClick = {
+                    if (isPlaying) previewPlayer.pause()
+                    else {
+                        if (effectiveRanges.isNotEmpty() && currentRangeIdx < effectiveRanges.size) {
+                            val r = effectiveRanges[currentRangeIdx]
+                            if (previewPlayer.currentPosition < r.startMs ||
+                                previewPlayer.currentPosition >= r.endMs) {
+                                previewPlayer.seekTo(r.startMs)
+                            }
+                        }
+                        previewPlayer.play()
+                    }
+                }) {
+                    Icon(
+                        if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                        contentDescription = if (isPlaying) "Pause" else "Play",
+                        modifier = Modifier.size(36.dp)
+                    )
+                }
+                TextButton(onClick = {
+                    if (effectiveRanges.isNotEmpty()) {
+                        currentRangeIdx = 0
+                        previewPlayer.seekTo(effectiveRanges[0].startMs)
+                        previewPlayer.play()
+                    }
+                }) {
+                    Text("⏮ Restart")
+                }
+            }
+
+            Spacer(Modifier.weight(1f))
+
+            // Confirm export bar
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(MaterialTheme.colorScheme.surface)
+                    .padding(16.dp)
+            ) {
+                Text(
+                    "Ready to export?",
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    "This will create a new video file with the segments above.",
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
+                )
+                Spacer(Modifier.height(12.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = onBack,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("Back to edit")
+                    }
+                    Button(
+                        onClick = onConfirm,
+                        modifier = Modifier.weight(1f),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = MaterialTheme.colorScheme.secondary,
+                            contentColor = MaterialTheme.colorScheme.onSecondary
+                        )
+                    ) {
+                        Text("Confirm export")
+                    }
+                }
+            }
+        }
+    }
 }
 
 fun formatTime(ms: Long): String {
