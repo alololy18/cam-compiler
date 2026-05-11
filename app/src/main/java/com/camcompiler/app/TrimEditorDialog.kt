@@ -1033,6 +1033,7 @@ private fun ExportPreviewOverlay(
     // The preview is "playing through" — we track which range is currently playing
     var currentRangeIdx by remember { mutableStateOf(0) }
     var isPlaying by remember { mutableStateOf(true) }
+    var playerPositionMs by remember { mutableStateOf(0L) }
 
     val previewPlayer = remember {
         ExoPlayer.Builder(context).build().apply {
@@ -1050,20 +1051,19 @@ private fun ExportPreviewOverlay(
         }
     }
 
-    // Monitor playback: when current range ends, advance to next or stop
+    // Monitor playback: track position + advance when range ends
     LaunchedEffect(previewPlayer, effectiveRanges) {
         while (true) {
             isPlaying = previewPlayer.isPlaying
+            playerPositionMs = previewPlayer.currentPosition
             if (effectiveRanges.isNotEmpty() && currentRangeIdx < effectiveRanges.size) {
                 val r = effectiveRanges[currentRangeIdx]
                 if (previewPlayer.currentPosition >= r.endMs && previewPlayer.isPlaying) {
-                    // Move to next range
                     val next = currentRangeIdx + 1
                     if (next < effectiveRanges.size) {
                         currentRangeIdx = next
                         previewPlayer.seekTo(effectiveRanges[next].startMs)
                     } else {
-                        // End of preview
                         previewPlayer.pause()
                         previewPlayer.seekTo(effectiveRanges[0].startMs)
                         currentRangeIdx = 0
@@ -1120,7 +1120,67 @@ private fun ExportPreviewOverlay(
                 )
             }
 
-            Spacer(Modifier.height(12.dp))
+            // ===== Output-timeline scrubber =====
+            // Compute current output time from currentRangeIdx + player position within that range
+            val outputPositionMs = run {
+                if (effectiveRanges.isEmpty() || currentRangeIdx >= effectiveRanges.size) 0L
+                else {
+                    val priorDurations = (0 until currentRangeIdx).sumOf { effectiveRanges[it].durationMs }
+                    val withinRange = (playerPositionMs - effectiveRanges[currentRangeIdx].startMs)
+                        .coerceAtLeast(0L)
+                        .coerceAtMost(effectiveRanges[currentRangeIdx].durationMs)
+                    priorDurations + withinRange
+                }
+            }
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(MaterialTheme.colorScheme.surface)
+                    .padding(horizontal = 12.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    formatTime(outputPositionMs),
+                    fontSize = 10.sp,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f),
+                    modifier = Modifier.width(56.dp)
+                )
+                Slider(
+                    value = outputPositionMs.toFloat().coerceIn(0f, totalDurationMs.toFloat().coerceAtLeast(1f)),
+                    onValueChange = { newOutputMs ->
+                        // Map output time → which range + source position
+                        var remainingMs = newOutputMs.toLong().coerceAtLeast(0L)
+                        var targetIdx = 0
+                        for ((i, r) in effectiveRanges.withIndex()) {
+                            if (remainingMs <= r.durationMs) {
+                                targetIdx = i
+                                break
+                            }
+                            remainingMs -= r.durationMs
+                            targetIdx = i  // fallback to last if we exhaust
+                        }
+                        if (effectiveRanges.isNotEmpty() && targetIdx < effectiveRanges.size) {
+                            val target = effectiveRanges[targetIdx]
+                            val targetSourceMs = (target.startMs + remainingMs)
+                                .coerceIn(target.startMs, target.endMs)
+                            currentRangeIdx = targetIdx
+                            previewPlayer.seekTo(targetSourceMs)
+                        }
+                    },
+                    valueRange = 0f..totalDurationMs.toFloat().coerceAtLeast(1f),
+                    modifier = Modifier.weight(1f)
+                )
+                Text(
+                    formatTime(totalDurationMs),
+                    fontSize = 10.sp,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f),
+                    modifier = Modifier.width(56.dp),
+                    textAlign = androidx.compose.ui.text.style.TextAlign.End
+                )
+            }
+
+            Spacer(Modifier.height(8.dp))
 
             // Currently playing segment indicator
             Column(modifier = Modifier.padding(horizontal = 16.dp)) {
