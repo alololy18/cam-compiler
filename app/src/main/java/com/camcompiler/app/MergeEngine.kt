@@ -4,6 +4,7 @@ import android.content.Context
 import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
+import android.media.MediaMetadataRetriever
 import android.media.MediaMuxer
 import android.net.Uri
 import android.os.ParcelFileDescriptor
@@ -30,17 +31,16 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * Two-mode merge engine:
+ * Merge engine v8.
  *
- * FAST: pure stream copy via MediaMuxer + MediaExtractor.
- *   Use when all clips share codec/resolution/framerate. Lossless. Fast.
+ * Accepts an EditProject and chooses one of two paths:
  *
- * COMPATIBLE: re-encode via Media3 Transformer.
- *   Use when clips have differing parameters. Slower; one generation of
- *   quality loss. Outputs uniform H.264/AAC.
+ *   FAST       — no music. For each clip, MediaMuxer stream-copies its
+ *                effective trim ranges (in order). Lossless.
  *
- * The caller (MainActivity) decides which mode based on ClipAnalyzer's result
- * and (when clips differ) the user's choice in the mismatch dialog.
+ *   COMPATIBLE — music present OR caller explicitly requests re-encode.
+ *                Media3 Transformer composition with one EditedMediaItem
+ *                per (clip, range) pair, plus an optional looping music sequence.
  */
 object MergeEngine {
 
@@ -56,20 +56,22 @@ object MergeEngine {
 
     suspend fun merge(
         ctx: Context,
-        clipUris: List<Uri>,
+        project: EditProject,
         outputUri: Uri,
         mode: Mode,
         onProgress: (Float, String) -> Unit
     ): Result = coroutineScope {
-        if (clipUris.isEmpty()) return@coroutineScope Result.Failure("No clips to merge")
+        if (project.clipEdits.isEmpty()) return@coroutineScope Result.Failure("No clips to merge")
 
         val tempFile = createTempFile(ctx)
         try {
             when (mode) {
                 Mode.FAST -> {
-                    onProgress(0f, "Fast merge (stream copy)...")
+                    val label = if (project.hasClipEdits()) "Fast merge (stream copy with trim)..."
+                        else "Fast merge (stream copy)..."
+                    onProgress(0f, label)
                     val r = withContext(Dispatchers.IO) {
-                        muxClipsFast(ctx, clipUris, tempFile, onProgress)
+                        muxClipsFast(ctx, project, tempFile, onProgress)
                     }
                     if (!r.success) return@coroutineScope Result.Failure(r.error)
                     onProgress(0.95f, "Saving to chosen location...")
@@ -81,7 +83,7 @@ object MergeEngine {
                 }
                 Mode.COMPATIBLE -> {
                     onProgress(0f, "Compatible merge (re-encoding)...")
-                    val r = mergeCompatible(ctx, clipUris, tempFile, onProgress)
+                    val r = mergeCompatible(ctx, project, tempFile, onProgress)
                     if (!r.first) return@coroutineScope Result.Failure(r.second)
                     onProgress(0.95f, "Saving to chosen location...")
                     if (!withContext(Dispatchers.IO) { copyTempToOutput(ctx, tempFile, outputUri) }) {
@@ -96,28 +98,32 @@ object MergeEngine {
         }
     }
 
-    // ===== Fast mode: MediaMuxer stream copy =====
+    // ===== Fast mode: MediaMuxer stream copy with multi-range trim =====
 
     private data class MuxResult(val success: Boolean, val error: String = "", val skippedClips: Int = 0)
 
     private fun muxClipsFast(
         ctx: Context,
-        clipUris: List<Uri>,
+        project: EditProject,
         outputFile: File,
         onProgress: (Float, String) -> Unit
     ): MuxResult {
+        if (project.hasMusic()) {
+            return MuxResult(false, "Music requires re-encoding (Compatible mode)")
+        }
+
         var muxer: MediaMuxer? = null
         var muxerStarted = false
         var videoOutTrack = -1
         var audioOutTrack = -1
-        var clipTimeOffsetUs = 0L
+        var globalTimeOffsetUs = 0L
         var skipped = 0
 
         try {
             muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
             val buffer = ByteBuffer.allocate(BUFFER_SIZE)
 
-            val firstFormats = readClipFormats(ctx, clipUris[0])
+            val firstFormats = readClipFormats(ctx, project.clipEdits[0].sourceUri)
                 ?: return MuxResult(false, "Could not read first clip")
             firstFormats.videoFormat?.let { videoOutTrack = muxer.addTrack(it) }
             firstFormats.audioFormat?.let { audioOutTrack = muxer.addTrack(it) }
@@ -127,10 +133,15 @@ object MergeEngine {
             muxer.start()
             muxerStarted = true
 
-            for ((idx, uri) in clipUris.withIndex()) {
-                onProgress(idx.toFloat() / clipUris.size * 0.95f, "Merging clip ${idx + 1}/${clipUris.size}...")
+            for ((clipIdx, edit) in project.clipEdits.withIndex()) {
+                val baseProgress = clipIdx.toFloat() / project.clipEdits.size
+
+                // Resolve duration so we can compute effective ranges
+                val clipDurationMs = readDurationMs(ctx, edit.sourceUri)
+                val ranges = edit.effectiveRanges(clipDurationMs)
+
                 val extractor = MediaExtractor()
-                val pfd = openPfd(ctx, uri)
+                val pfd = openPfd(ctx, edit.sourceUri)
                 if (pfd == null) { skipped++; continue }
                 try {
                     extractor.setDataSource(pfd.fileDescriptor)
@@ -145,17 +156,48 @@ object MergeEngine {
                     }
                     if (vTrack < 0) { skipped++; continue }
 
-                    val vFirstPts = peekFirstPts(extractor, vTrack)
-                    val aFirstPts = if (aTrack >= 0) peekFirstPts(extractor, aTrack) else 0L
+                    // For each effective range, copy its samples with appropriate offset
+                    for ((rangeIdx, range) in ranges.withIndex()) {
+                        val rangeFraction = (rangeIdx + 1).toFloat() / ranges.size
+                        onProgress(
+                            (baseProgress + rangeFraction / project.clipEdits.size) * 0.95f,
+                            "Merging clip ${clipIdx + 1}/${project.clipEdits.size} (segment ${rangeIdx + 1}/${ranges.size})..."
+                        )
 
-                    val vEnd = copyTrack(extractor, vTrack, muxer, videoOutTrack, clipTimeOffsetUs, vFirstPts, buffer)
-                    var aEnd = 0L
-                    if (aTrack >= 0 && audioOutTrack >= 0) {
-                        aEnd = copyTrack(extractor, aTrack, muxer, audioOutTrack, clipTimeOffsetUs, aFirstPts, buffer)
+                        val trimStartUs = range.startMs * 1000L
+                        val trimEndUs = range.endMs * 1000L
+
+                        // Find each track's actual landing PTS after seek
+                        extractor.selectTrack(vTrack)
+                        extractor.seekTo(trimStartUs, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
+                        val vFirstPts = extractor.sampleTime.coerceAtLeast(0L)
+                        extractor.unselectTrack(vTrack)
+
+                        val aFirstPts = if (aTrack >= 0) {
+                            extractor.selectTrack(aTrack)
+                            extractor.seekTo(trimStartUs, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
+                            val pts = extractor.sampleTime.coerceAtLeast(0L)
+                            extractor.unselectTrack(aTrack)
+                            pts
+                        } else 0L
+
+                        val vEnd = copyTrackWithTrim(
+                            extractor, vTrack, muxer, videoOutTrack,
+                            globalTimeOffsetUs, vFirstPts, trimStartUs, trimEndUs, buffer
+                        )
+                        var aEnd = 0L
+                        if (aTrack >= 0 && audioOutTrack >= 0) {
+                            aEnd = copyTrackWithTrim(
+                                extractor, aTrack, muxer, audioOutTrack,
+                                globalTimeOffsetUs, aFirstPts, trimStartUs, trimEndUs, buffer
+                            )
+                        }
+
+                        val rangeEnd = maxOf(vEnd, aEnd)
+                        if (rangeEnd > 0) {
+                            globalTimeOffsetUs = rangeEnd + frameDurationUs
+                        }
                     }
-
-                    val clipEnd = maxOf(vEnd, aEnd)
-                    if (clipEnd > 0) clipTimeOffsetUs = clipEnd + frameDurationUs
                 } finally {
                     extractor.release()
                     pfd.close()
@@ -169,19 +211,85 @@ object MergeEngine {
         }
     }
 
-    // ===== Compatible mode: Media3 Transformer re-encode =====
+    private fun copyTrackWithTrim(
+        extractor: MediaExtractor,
+        inputTrack: Int,
+        muxer: MediaMuxer,
+        outputTrack: Int,
+        baseOffsetUs: Long,
+        firstPtsUs: Long,
+        trimStartUs: Long,
+        trimEndUs: Long,
+        buffer: ByteBuffer
+    ): Long {
+        extractor.selectTrack(inputTrack)
+        extractor.seekTo(trimStartUs, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
+        val info = MediaCodec.BufferInfo()
+        var maxOutPts = 0L
+        while (true) {
+            buffer.clear()
+            val size = extractor.readSampleData(buffer, 0)
+            if (size < 0) break
+            val originalPts = extractor.sampleTime
+            if (originalPts >= trimEndUs) break
+            val outPts = (originalPts - firstPtsUs).coerceAtLeast(0L) + baseOffsetUs
+            info.size = size
+            info.offset = 0
+            info.presentationTimeUs = outPts
+            info.flags = extractor.sampleFlags
+            if (outPts > maxOutPts) maxOutPts = outPts
+            muxer.writeSampleData(outputTrack, buffer, info)
+            extractor.advance()
+        }
+        extractor.unselectTrack(inputTrack)
+        return maxOutPts
+    }
+
+    // ===== Compatible mode: Media3 Transformer with multi-range + looping music =====
 
     @OptIn(UnstableApi::class)
     private suspend fun mergeCompatible(
         ctx: Context,
-        clipUris: List<Uri>,
+        project: EditProject,
         outputFile: File,
         onProgress: (Float, String) -> Unit
     ): Pair<Boolean, String> = withContext(Dispatchers.Main) {
         val deferred = CompletableDeferred<Pair<Boolean, String>>()
-        val items = clipUris.map { EditedMediaItem.Builder(MediaItem.fromUri(it)).build() }
-        val sequence = EditedMediaItemSequence(items)
-        val composition: Composition = Composition.Builder(listOf(sequence)).build()
+
+        // Resolve each clip's effective ranges and expand into one EditedMediaItem per range.
+        // We need each clip's duration to resolve "effective ranges".
+        val items = mutableListOf<EditedMediaItem>()
+        for (edit in project.clipEdits) {
+            val clipDurationMs = readDurationMs(ctx, edit.sourceUri)
+            val ranges = edit.effectiveRanges(clipDurationMs)
+            for (range in ranges) {
+                val mediaItem = MediaItem.Builder()
+                    .setUri(edit.sourceUri)
+                    .setClippingConfiguration(
+                        MediaItem.ClippingConfiguration.Builder()
+                            .setStartPositionMs(range.startMs)
+                            .setEndPositionMs(range.endMs)
+                            .build()
+                    )
+                    .build()
+                items.add(EditedMediaItem.Builder(mediaItem).build())
+            }
+        }
+
+        if (items.isEmpty()) {
+            return@withContext false to "No segments to merge after applying trim"
+        }
+
+        val mainSequence = EditedMediaItemSequence(items)
+
+        val composition: Composition = if (project.musicUri != null) {
+            val musicItem = EditedMediaItem.Builder(MediaItem.fromUri(project.musicUri)).build()
+            // Media3 1.4.1: EditedMediaItemSequence(List, boolean isLooping)
+            val musicSequence = EditedMediaItemSequence(listOf(musicItem), /* isLooping = */ true)
+            Composition.Builder(listOf(mainSequence, musicSequence)).build()
+        } else {
+            Composition.Builder(listOf(mainSequence)).build()
+        }
 
         val transformer = Transformer.Builder(ctx)
             .addListener(object : Transformer.Listener {
@@ -237,51 +345,22 @@ object MergeEngine {
         finally { extractor.release(); pfd.close() }
     }
 
+    private fun readDurationMs(ctx: Context, uri: Uri): Long {
+        return try {
+            val retriever = MediaMetadataRetriever()
+            retriever.setDataSource(ctx, uri)
+            val d = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLong() ?: 0L
+            retriever.release()
+            d
+        } catch (_: Exception) { 0L }
+    }
+
     private fun deriveFrameDurationUs(fmt: MediaFormat?): Long {
         if (fmt == null) return DEFAULT_FRAME_DURATION_US
         return try {
             val fr = fmt.getInteger(MediaFormat.KEY_FRAME_RATE)
             if (fr > 0) (1_000_000L / fr) else DEFAULT_FRAME_DURATION_US
         } catch (_: Exception) { DEFAULT_FRAME_DURATION_US }
-    }
-
-    private fun peekFirstPts(extractor: MediaExtractor, trackIdx: Int): Long {
-        extractor.selectTrack(trackIdx)
-        extractor.seekTo(0L, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
-        val pts = extractor.sampleTime.coerceAtLeast(0L)
-        extractor.unselectTrack(trackIdx)
-        return pts
-    }
-
-    private fun copyTrack(
-        extractor: MediaExtractor,
-        inputTrack: Int,
-        muxer: MediaMuxer,
-        outputTrack: Int,
-        baseOffsetUs: Long,
-        firstPtsUs: Long,
-        buffer: ByteBuffer
-    ): Long {
-        extractor.selectTrack(inputTrack)
-        extractor.seekTo(0L, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
-        val info = MediaCodec.BufferInfo()
-        var maxOutPts = 0L
-        while (true) {
-            buffer.clear()
-            val size = extractor.readSampleData(buffer, 0)
-            if (size < 0) break
-            val originalPts = extractor.sampleTime
-            val outPts = (originalPts - firstPtsUs).coerceAtLeast(0L) + baseOffsetUs
-            info.size = size
-            info.offset = 0
-            info.presentationTimeUs = outPts
-            info.flags = extractor.sampleFlags
-            if (outPts > maxOutPts) maxOutPts = outPts
-            muxer.writeSampleData(outputTrack, buffer, info)
-            extractor.advance()
-        }
-        extractor.unselectTrack(inputTrack)
-        return maxOutPts
     }
 
     private fun openPfd(ctx: Context, uri: Uri): ParcelFileDescriptor? = try {
