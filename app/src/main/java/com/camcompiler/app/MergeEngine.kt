@@ -1,6 +1,9 @@
 package com.camcompiler.app
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
 import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
@@ -8,6 +11,7 @@ import android.media.MediaMetadataRetriever
 import android.media.MediaMuxer
 import android.net.Uri
 import android.os.ParcelFileDescriptor
+import androidx.core.net.toUri
 import androidx.media3.common.MediaItem
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.transformer.Composition
@@ -25,6 +29,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -256,13 +261,23 @@ object MergeEngine {
     ): Pair<Boolean, String> = withContext(Dispatchers.Main) {
         val deferred = CompletableDeferred<Pair<Boolean, String>>()
 
-        // Resolve each clip's effective ranges and expand into one EditedMediaItem per range.
-        // We need each clip's duration to resolve "effective ranges".
+        // Black image URI (cached, generated once)
+        val needsBlackImage = project.hasClipTransitions() || project.hasAnyRangeTransitions()
+        val blackImageUri: Uri? = if (needsBlackImage) getOrCreateBlackImageUri(ctx) else null
+
+        // Build the sequence with transitions interspersed.
+        // For each clip:
+        //   For each range j in clip:
+        //     Add range EditedMediaItem
+        //     If j < lastRange AND rangeTransition[j] != NONE: add black image
+        //   If i < lastClip AND clipTransition[i] != NONE: add black image
         val items = mutableListOf<EditedMediaItem>()
-        for (edit in project.clipEdits) {
+
+        for ((clipIdx, edit) in project.clipEdits.withIndex()) {
             val clipDurationMs = readDurationMs(ctx, edit.sourceUri)
             val ranges = edit.effectiveRanges(clipDurationMs)
-            for (range in ranges) {
+
+            for ((rangeIdx, range) in ranges.withIndex()) {
                 val mediaItem = MediaItem.Builder()
                     .setUri(edit.sourceUri)
                     .setClippingConfiguration(
@@ -273,6 +288,22 @@ object MergeEngine {
                     )
                     .build()
                 items.add(EditedMediaItem.Builder(mediaItem).build())
+
+                // Range-to-range transition (within the same clip)
+                if (rangeIdx < ranges.size - 1) {
+                    val rt = edit.transitionAt(rangeIdx)
+                    if (rt != Transition.NONE && blackImageUri != null) {
+                        items.add(buildBlackImageItem(blackImageUri, rt))
+                    }
+                }
+            }
+
+            // Clip-to-clip transition (between clips)
+            if (clipIdx < project.clipEdits.size - 1) {
+                val ct = project.transitionAt(clipIdx)
+                if (ct != Transition.NONE && blackImageUri != null) {
+                    items.add(buildBlackImageItem(blackImageUri, ct))
+                }
             }
         }
 
@@ -284,7 +315,6 @@ object MergeEngine {
 
         val composition: Composition = if (project.musicUri != null) {
             val musicItem = EditedMediaItem.Builder(MediaItem.fromUri(project.musicUri)).build()
-            // Media3 1.4.1: EditedMediaItemSequence(List, boolean isLooping)
             val musicSequence = EditedMediaItemSequence(listOf(musicItem), /* isLooping = */ true)
             Composition.Builder(listOf(mainSequence, musicSequence)).build()
         } else {
@@ -319,6 +349,27 @@ object MergeEngine {
             }
         }
         deferred.await()
+    }
+
+    /**
+     * Build a black image EditedMediaItem for a transition. Duration depends on
+     * the transition type (HOLD_BLACK is shorter than FADE_BLACK).
+     */
+    @OptIn(UnstableApi::class)
+    private fun buildBlackImageItem(blackImageUri: Uri, transition: Transition): EditedMediaItem {
+        val durationMs = when (transition) {
+            Transition.HOLD_BLACK -> Transition.HOLD_DURATION_MS
+            Transition.FADE_BLACK -> Transition.DURATION_MS
+            Transition.NONE -> 0L  // shouldn't happen, caller filters
+        }
+        val mediaItem = MediaItem.Builder()
+            .setUri(blackImageUri)
+            .setImageDurationMs(durationMs)
+            .build()
+        return EditedMediaItem.Builder(mediaItem)
+            .setFrameRate(30)
+            .setDurationUs(durationMs * 1000L)
+            .build()
     }
 
     // ===== Shared helpers =====
@@ -379,5 +430,28 @@ object MergeEngine {
     private fun createTempFile(ctx: Context): File {
         val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
         return File(ctx.cacheDir, "merge_temp_$ts.mp4")
+    }
+
+    /**
+     * Generates a small black PNG and writes it to a stable file in cache.
+     * Returns a content/file URI usable by Media3's image MediaItem.
+     * Cached file is reused across merges.
+     */
+    private fun getOrCreateBlackImageUri(ctx: Context): Uri {
+        val cached = File(ctx.cacheDir, "transition_black_1280x720.png")
+        if (cached.exists() && cached.length() > 0) {
+            return cached.toUri()
+        }
+        // Small bitmap is fine — Media3 scales image inputs to the output resolution.
+        // 1280x720 is a common HD size; the encoder will handle resizing if clips differ.
+        val bmp = Bitmap.createBitmap(1280, 720, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bmp)
+        canvas.drawColor(Color.BLACK)
+        FileOutputStream(cached).use { out ->
+            bmp.compress(Bitmap.CompressFormat.PNG, 100, out)
+            out.flush()
+        }
+        bmp.recycle()
+        return cached.toUri()
     }
 }
