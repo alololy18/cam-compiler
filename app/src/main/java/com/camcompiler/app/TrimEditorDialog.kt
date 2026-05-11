@@ -96,25 +96,14 @@ fun TrimEditorDialog(
     var playerPositionMs by remember { mutableStateOf(0L) }
     var isPlaying by remember { mutableStateOf(false) }
 
-    val previewRange: TrimRange? = remember(ranges, trimMode, selectedRangeIdx, playOrder) {
-        val effective = ClipEdit(clip.uri, ranges, trimMode, playOrder).effectiveRanges(clipDurationMs)
-        when {
-            effective.isEmpty() -> null
-            selectedRangeIdx != null && selectedRangeIdx!! < ranges.size && trimMode == TrimMode.KEEP_RANGES ->
-                ranges.getOrNull(selectedRangeIdx!!)
-            else -> effective.first()
-        }
-    }
-
+    // Polling loop: tracks player position and play state for UI. Does NOT enforce
+    // any "stop at preview range end" behavior — that would fight against the user's
+    // manual seek (e.g. they drag the playhead outside the range and try to play).
+    // The user can manually pause when desired.
     LaunchedEffect(exoPlayer) {
         while (true) {
             playerPositionMs = exoPlayer.currentPosition
             isPlaying = exoPlayer.isPlaying
-            val pr = previewRange
-            if (pr != null && exoPlayer.isPlaying && exoPlayer.currentPosition >= pr.endMs) {
-                exoPlayer.pause()
-                exoPlayer.seekTo(pr.endMs)
-            }
             delay(50)
         }
     }
@@ -254,9 +243,12 @@ fun TrimEditorDialog(
                             if (isPlaying) {
                                 exoPlayer.pause()
                             } else {
-                                val pr = previewRange
-                                if (pr != null && (playerPositionMs >= pr.endMs || playerPositionMs < pr.startMs)) {
-                                    exoPlayer.seekTo(pr.startMs)
+                                // Just play from current position. Don't force-seek into a
+                                // preview range — the user may have intentionally seeked
+                                // outside the range and wants to play from there.
+                                // If position is past end-of-clip, restart from 0.
+                                if (playerPositionMs >= clipDurationMs - 50L) {
+                                    exoPlayer.seekTo(0L)
                                 }
                                 exoPlayer.play()
                             }
@@ -725,8 +717,19 @@ private fun PlayheadStrip(
 ) {
     val density = LocalDensity.current
 
-    // Absolute-position drag state: during drag, this overrides the prop-driven position
-    // so live-scrub seeks don't cause the visual to jitter from prop updates.
+    // CRITICAL: pointerInput lambdas capture references at the time they're established.
+    // If we just read `playheadMs` inside the lambda, we get a stale value (whatever it was
+    // when the lambda was first created). That caused the playhead to "jump back to zero"
+    // when dragging — onDragStart was reading playheadMs from initial composition.
+    //
+    // Fix: route prop access through rememberUpdatedState so the lambda sees the
+    // latest value via .value (a stable State reference).
+    val playheadMsState = rememberUpdatedState(playheadMs)
+    val onPlayheadSeekState = rememberUpdatedState(onPlayheadSeek)
+
+    // Absolute-position drag state: during drag, this overrides the prop-driven position.
+    // During drag we do NOT seek the player live — only the visual moves. On release,
+    // we seek once. This avoids player state churn and the polling-loop tug-of-war.
     var dragAbsoluteMs by remember { mutableStateOf<Long?>(null) }
     val renderMs = dragAbsoluteMs ?: playheadMs
 
@@ -759,7 +762,9 @@ private fun PlayheadStrip(
                     .fillMaxSize()
                     .pointerInput(durationMs) {
                         detectTapGestures { offset ->
-                            onPlayheadSeek(xToMs(offset.x).coerceIn(0L, durationMs))
+                            onPlayheadSeekState.value(
+                                xToMs(offset.x).coerceIn(0L, durationMs)
+                            )
                         }
                     }
             )
@@ -773,20 +778,23 @@ private fun PlayheadStrip(
                     .height(28.dp)
                     .pointerInput(durationMs) {
                         detectDragGestures(
-                            onDragStart = { dragAbsoluteMs = playheadMs },
+                            onDragStart = {
+                                // Snapshot the LATEST playheadMs via the state ref
+                                dragAbsoluteMs = playheadMsState.value
+                            },
                             onDragEnd = {
-                                val finalMs = (dragAbsoluteMs ?: playheadMs)
+                                val finalMs = (dragAbsoluteMs ?: playheadMsState.value)
                                     .coerceIn(0L, durationMs)
                                 dragAbsoluteMs = null
-                                onPlayheadSeek(finalMs)
+                                onPlayheadSeekState.value(finalMs)
                             },
                             onDragCancel = { dragAbsoluteMs = null },
                             onDrag = { _, dragAmount ->
                                 val deltaMs = xToMs(dragAmount.x)
-                                val current = dragAbsoluteMs ?: playheadMs
+                                val current = dragAbsoluteMs ?: playheadMsState.value
                                 val proposed = (current + deltaMs).coerceIn(0L, durationMs)
                                 dragAbsoluteMs = proposed
-                                onPlayheadSeek(proposed)
+                                // NOTE: no seekTo during drag. Only on release.
                             }
                         )
                     }
