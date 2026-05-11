@@ -20,8 +20,8 @@ enum class Transition(
     NONE("No transition", "None", 0L),
     CUT_BLACK("Cut to black (short)", "Cut", 200L),
     HOLD_BLACK("Hold on black", "Hold", 500L),
-    FADE_BLACK("Fade through black (slow)", "Fade", 800L),
-    FLASH_WHITE("White flash", "Flash", 200L, isWhite = true);
+    FADE_BLACK("Fade through black (slow)", "Fade", 1500L),
+    FLASH_WHITE("White flash", "Flash", 400L, isWhite = true);
 
     /** Cycle to the next transition type. */
     fun next(): Transition = entries[(ordinal + 1) % entries.size]
