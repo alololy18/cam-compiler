@@ -7,21 +7,8 @@ import android.media.MediaFormat
 import android.media.MediaMuxer
 import android.net.Uri
 import android.os.ParcelFileDescriptor
-import androidx.media3.common.MediaItem
-import androidx.media3.common.util.UnstableApi
-import androidx.media3.transformer.Composition
-import androidx.media3.transformer.EditedMediaItem
-import androidx.media3.transformer.EditedMediaItemSequence
-import androidx.media3.transformer.ExportException
-import androidx.media3.transformer.ExportResult
-import androidx.media3.transformer.ProgressHolder
-import androidx.media3.transformer.Transformer
-import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.nio.ByteBuffer
@@ -29,18 +16,34 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+/**
+ * Merge engine using Android's built-in MediaMuxer + MediaExtractor.
+ *
+ * This is sample-by-sample stream copy — no decoding, no re-encoding.
+ * Output is guaranteed to be playable on Android because it goes through
+ * the same framework as the system video player.
+ *
+ * Performance characteristic: bottlenecked by storage I/O, not CPU.
+ * For typical action-cam clips (same codec, same resolution, same fps),
+ * merge time ≈ (total input size) / (read speed + write speed).
+ *
+ * Why we dropped mp4parser: its output has known Android compatibility
+ * issues (GitHub issue sannies/mp4parser#102) — files play in VLC but not
+ * in Android's stock player.
+ *
+ * Why we dropped Media3 Transformer: when input clips have any minor
+ * difference (codec config, fps variation, audio sample-rate), Media3
+ * silently re-encodes, which takes 10-50x longer.
+ */
 object MergeEngine {
 
-    private const val BUFFER_SIZE = 1024 * 1024
+    private const val BUFFER_SIZE = 1024 * 1024  // 1 MB sample buffer
 
     sealed class Result {
         data class Success(val method: String, val outputBytes: Long, val skipped: Int) : Result()
         data class Failure(val message: String) : Result()
     }
 
-    /**
-     * Merges clipUris in the given order, writing the merged video to outputUri.
-     */
     suspend fun merge(
         ctx: Context,
         clipUris: List<Uri>,
@@ -49,197 +52,112 @@ object MergeEngine {
     ): Result = coroutineScope {
         if (clipUris.isEmpty()) return@coroutineScope Result.Failure("No clips to merge")
 
-        // Always produce to a temp file first, then copy to the chosen output URI.
         val tempFile = createTempFile(ctx)
-
         try {
-            // Tier 1: mp4parser
-            onProgress(0f, "Fast merge (mp4parser)...")
-            val mp4r = withContext(Dispatchers.IO) {
-                Mp4ParserMerger.merge(ctx, clipUris, tempFile) { p, s -> onProgress(p * 0.7f, s) }
+            onProgress(0f, "Preparing to merge ${clipUris.size} clips...")
+            val muxResult = withContext(Dispatchers.IO) {
+                muxClips(ctx, clipUris, tempFile, onProgress)
             }
-            if (mp4r.success) {
-                // mp4parser may produce non-standard MP4 atoms that some video players reject
-                // (even though MediaExtractor can parse them). Always re-mux through MediaMuxer
-                // for guaranteed compatibility. This step is fast — just copies streams.
-                onProgress(0.72f, "Re-muxing for compatibility...")
-                val remuxFile = createTempFile(ctx)
-                val remuxResult = tryMediaMuxer(ctx, listOf(Uri.fromFile(tempFile)), remuxFile) { p, s ->
-                    onProgress(0.72f + (p * 0.20f), "Compatibility pass: $s")
-                }
-                if (remuxResult.success && withContext(Dispatchers.IO) { isPlayable(remuxFile) }) {
-                    onProgress(0.95f, "Saving to chosen location...")
-                    if (copyTempToOutput(ctx, remuxFile, outputUri)) {
-                        val r = Result.Success("mp4parser+compat", remuxFile.length(), mp4r.skippedCount)
-                        remuxFile.delete()
-                        return@coroutineScope r
-                    }
-                    remuxFile.delete()
-                    return@coroutineScope Result.Failure("Merge succeeded but could not save to chosen location")
-                }
-                // Compatibility re-mux failed. Fall back to direct mp4parser output but warn.
-                remuxFile.delete()
-                if (withContext(Dispatchers.IO) { isPlayable(tempFile) }) {
-                    onProgress(0.95f, "Saving (compatibility pass skipped)...")
-                    if (copyTempToOutput(ctx, tempFile, outputUri)) {
-                        return@coroutineScope Result.Success("mp4parser-raw", tempFile.length(), mp4r.skippedCount)
-                    }
-                    return@coroutineScope Result.Failure("Merge succeeded but could not save to chosen location")
-                }
-                // Output not playable at all — fall through to MediaMuxer-from-scratch
-                onProgress(0.0f, "mp4parser output unusable — re-merging with MediaMuxer...")
+            if (!muxResult.success) {
+                return@coroutineScope Result.Failure(muxResult.error)
             }
-            val mp4ParserError = if (mp4r.success) "Output not playable" else mp4r.error
-            tempFile.delete()
 
-            // Tier 2: MediaMuxer
-            onProgress(0f, "Trying MediaMuxer fallback...")
-            val tempFile2 = createTempFile(ctx)
-            val muxResult = tryMediaMuxer(ctx, clipUris, tempFile2, onProgress)
-            if (muxResult.success) {
-                onProgress(0.95f, "Saving to chosen location...")
-                if (copyTempToOutput(ctx, tempFile2, outputUri)) {
-                    val r = Result.Success("MediaMuxer", tempFile2.length(), 0)
-                    tempFile2.delete()
-                    return@coroutineScope r
-                }
-                tempFile2.delete()
+            onProgress(0.95f, "Saving to chosen location...")
+            if (!withContext(Dispatchers.IO) { copyTempToOutput(ctx, tempFile, outputUri) }) {
                 return@coroutineScope Result.Failure("Merge succeeded but could not save to chosen location")
             }
-            val muxError = muxResult.error
-            tempFile2.delete()
-
-            // Tier 3: Media3 (slow re-encode possible)
-            onProgress(0f, "Trying Media3 fallback (slowest)...")
-            val tempFile3 = createTempFile(ctx)
-            val media3Result = tryMedia3(ctx, clipUris, tempFile3, onProgress)
-            if (media3Result.first) {
-                onProgress(0.95f, "Saving to chosen location...")
-                if (copyTempToOutput(ctx, tempFile3, outputUri)) {
-                    val r = Result.Success("Media3", tempFile3.length(), 0)
-                    tempFile3.delete()
-                    return@coroutineScope r
-                }
-                tempFile3.delete()
-                return@coroutineScope Result.Failure("Merge succeeded but could not save to chosen location")
-            }
-            tempFile3.delete()
-
-            return@coroutineScope Result.Failure(
-                "All three merge methods failed. mp4parser: $mp4ParserError. MediaMuxer: $muxError. Media3: ${media3Result.second}"
+            onProgress(1f, "Done")
+            return@coroutineScope Result.Success(
+                method = "MediaMuxer",
+                outputBytes = tempFile.length(),
+                skipped = muxResult.skippedClips
             )
         } finally {
             tempFile.delete()
         }
     }
 
-    /** Returns true if Android's MediaExtractor can parse the file as playable video. */
-    private fun isPlayable(file: File): Boolean {
-        return try {
-            val extractor = MediaExtractor()
-            extractor.setDataSource(file.absolutePath)
-            var hasVideo = false
-            for (i in 0 until extractor.trackCount) {
-                val mime = extractor.getTrackFormat(i).getString(MediaFormat.KEY_MIME) ?: continue
-                if (mime.startsWith("video/")) { hasVideo = true; break }
-            }
-            extractor.release()
-            hasVideo
-        } catch (_: Exception) {
-            false
-        }
-    }
+    private data class MuxResult(
+        val success: Boolean,
+        val error: String = "",
+        val skippedClips: Int = 0
+    )
 
-    private fun copyTempToOutput(ctx: Context, tempFile: File, outputUri: Uri): Boolean {
-        return try {
-            // "wt" = write+truncate, ensures we don't leave stale bytes if the new file is shorter
-            ctx.contentResolver.openOutputStream(outputUri, "wt")?.use { out ->
-                tempFile.inputStream().use { it.copyTo(out, bufferSize = 1024 * 1024) }
-                out.flush()
-            } != null
-        } catch (_: Exception) {
-            false
-        }
-    }
-
-    private fun createTempFile(ctx: Context): File {
-        val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-        return File(ctx.cacheDir, "merge_temp_$timestamp.mp4")
-    }
-
-    // ===== Tier 2: MediaMuxer =====
-
-    private data class MuxResult(val success: Boolean, val error: String = "")
-
-    private suspend fun tryMediaMuxer(
+    private fun muxClips(
         ctx: Context,
         clipUris: List<Uri>,
         outputFile: File,
         onProgress: (Float, String) -> Unit
-    ): MuxResult = withContext(Dispatchers.IO) {
+    ): MuxResult {
         var muxer: MediaMuxer? = null
         var muxerStarted = false
         var videoOutTrack = -1
         var audioOutTrack = -1
         var videoTimeOffsetUs = 0L
         var audioTimeOffsetUs = 0L
+        var skipped = 0
 
         try {
             muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
             val buffer = ByteBuffer.allocate(BUFFER_SIZE)
 
-            val firstExtractor = MediaExtractor()
-            val firstPfd = openPfd(ctx, clipUris[0])
-                ?: return@withContext MuxResult(false, "Could not open first clip")
-            try {
-                firstExtractor.setDataSource(firstPfd.fileDescriptor)
-                for (i in 0 until firstExtractor.trackCount) {
-                    val fmt = firstExtractor.getTrackFormat(i)
-                    val mime = fmt.getString(MediaFormat.KEY_MIME) ?: continue
-                    when {
-                        mime.startsWith("video/") && videoOutTrack < 0 -> videoOutTrack = muxer.addTrack(fmt)
-                        mime.startsWith("audio/") && audioOutTrack < 0 -> audioOutTrack = muxer.addTrack(fmt)
-                    }
-                }
-            } finally {
-                firstExtractor.release()
-                firstPfd.close()
-            }
+            // Read first clip's format to set up muxer tracks
+            val firstFormats = readClipFormats(ctx, clipUris[0])
+                ?: return MuxResult(false, "Could not read format of first clip")
+            firstFormats.videoFormat?.let { videoOutTrack = muxer.addTrack(it) }
+            firstFormats.audioFormat?.let { audioOutTrack = muxer.addTrack(it) }
 
-            if (videoOutTrack < 0) return@withContext MuxResult(false, "No video track in first clip")
+            if (videoOutTrack < 0) {
+                return MuxResult(false, "First clip has no video track")
+            }
             muxer.start()
             muxerStarted = true
 
             for ((idx, uri) in clipUris.withIndex()) {
-                onProgress(idx.toFloat() / clipUris.size, "Copying clip ${idx + 1}/${clipUris.size}...")
+                val baseProgress = idx.toFloat() / clipUris.size
+                onProgress(baseProgress * 0.95f, "Merging clip ${idx + 1}/${clipUris.size}...")
+
                 val extractor = MediaExtractor()
-                val pfd = openPfd(ctx, uri) ?: continue
+                val pfd = openPfd(ctx, uri)
+                if (pfd == null) {
+                    skipped++
+                    continue
+                }
                 try {
                     extractor.setDataSource(pfd.fileDescriptor)
-                    var clipVideoTrack = -1
-                    var clipAudioTrack = -1
-                    var maxV = 0L
-                    var maxA = 0L
+
+                    var videoTrackIdx = -1
+                    var audioTrackIdx = -1
                     for (i in 0 until extractor.trackCount) {
-                        val fmt = extractor.getTrackFormat(i)
-                        val mime = fmt.getString(MediaFormat.KEY_MIME) ?: continue
+                        val mime = extractor.getTrackFormat(i).getString(MediaFormat.KEY_MIME) ?: continue
                         when {
-                            mime.startsWith("video/") && clipVideoTrack < 0 -> clipVideoTrack = i
-                            mime.startsWith("audio/") && clipAudioTrack < 0 -> clipAudioTrack = i
+                            mime.startsWith("video/") && videoTrackIdx < 0 -> videoTrackIdx = i
+                            mime.startsWith("audio/") && audioTrackIdx < 0 -> audioTrackIdx = i
                         }
                     }
-                    if (clipVideoTrack >= 0) maxV = copyTrack(extractor, clipVideoTrack, muxer, videoOutTrack, videoTimeOffsetUs, buffer)
-                    if (clipAudioTrack >= 0 && audioOutTrack >= 0) maxA = copyTrack(extractor, clipAudioTrack, muxer, audioOutTrack, audioTimeOffsetUs, buffer)
-                    if (maxV > 0) videoTimeOffsetUs = maxV + 33_000
-                    if (maxA > 0) audioTimeOffsetUs = maxA + 23_000
+
+                    if (videoTrackIdx < 0) {
+                        skipped++
+                        continue
+                    }
+
+                    val videoEnd = copyTrack(extractor, videoTrackIdx, muxer, videoOutTrack, videoTimeOffsetUs, buffer)
+                    var audioEnd = 0L
+                    if (audioTrackIdx >= 0 && audioOutTrack >= 0) {
+                        audioEnd = copyTrack(extractor, audioTrackIdx, muxer, audioOutTrack, audioTimeOffsetUs, buffer)
+                    }
+
+                    if (videoEnd > 0) videoTimeOffsetUs = videoEnd + 33_333
+                    if (audioEnd > 0) audioTimeOffsetUs = audioEnd + 23_220
                 } finally {
                     extractor.release()
                     pfd.close()
                 }
             }
-            return@withContext MuxResult(true)
+
+            return MuxResult(true, skippedClips = skipped)
         } catch (e: Exception) {
-            return@withContext MuxResult(false, e.message ?: "Unknown muxer error")
+            return MuxResult(false, e.message ?: "Unknown muxer error", skipped)
         } finally {
             try {
                 if (muxerStarted) muxer?.stop()
@@ -248,12 +166,38 @@ object MergeEngine {
         }
     }
 
+    private data class ClipFormats(val videoFormat: MediaFormat?, val audioFormat: MediaFormat?)
+
+    private fun readClipFormats(ctx: Context, uri: Uri): ClipFormats? {
+        val extractor = MediaExtractor()
+        val pfd = openPfd(ctx, uri) ?: return null
+        try {
+            extractor.setDataSource(pfd.fileDescriptor)
+            var video: MediaFormat? = null
+            var audio: MediaFormat? = null
+            for (i in 0 until extractor.trackCount) {
+                val fmt = extractor.getTrackFormat(i)
+                val mime = fmt.getString(MediaFormat.KEY_MIME) ?: continue
+                when {
+                    mime.startsWith("video/") && video == null -> video = fmt
+                    mime.startsWith("audio/") && audio == null -> audio = fmt
+                }
+            }
+            return ClipFormats(video, audio)
+        } catch (_: Exception) {
+            return null
+        } finally {
+            extractor.release()
+            pfd.close()
+        }
+    }
+
     private fun copyTrack(
         extractor: MediaExtractor,
         inputTrack: Int,
         muxer: MediaMuxer,
         outputTrack: Int,
-        offsetUs: Long,
+        timeOffsetUs: Long,
         buffer: ByteBuffer
     ): Long {
         extractor.selectTrack(inputTrack)
@@ -265,7 +209,7 @@ object MergeEngine {
             if (size < 0) break
             info.size = size
             info.offset = 0
-            info.presentationTimeUs = extractor.sampleTime + offsetUs
+            info.presentationTimeUs = extractor.sampleTime + timeOffsetUs
             info.flags = extractor.sampleFlags
             if (info.presentationTimeUs > maxTimeUs) maxTimeUs = info.presentationTimeUs
             muxer.writeSampleData(outputTrack, buffer, info)
@@ -279,47 +223,19 @@ object MergeEngine {
         ctx.contentResolver.openFileDescriptor(uri, "r")
     } catch (_: Exception) { null }
 
-    // ===== Tier 3: Media3 =====
-
-    @OptIn(UnstableApi::class)
-    private suspend fun tryMedia3(
-        ctx: Context,
-        clipUris: List<Uri>,
-        outputFile: File,
-        onProgress: (Float, String) -> Unit
-    ): Pair<Boolean, String> = withContext(Dispatchers.Main) {
-        val deferred = CompletableDeferred<Pair<Boolean, String>>()
-        val mediaItems = clipUris.map { EditedMediaItem.Builder(MediaItem.fromUri(it)).build() }
-        val sequence = EditedMediaItemSequence(mediaItems)
-        val composition: Composition = Composition.Builder(listOf(sequence)).build()
-
-        val transformer = Transformer.Builder(ctx)
-            .addListener(object : Transformer.Listener {
-                override fun onCompleted(c: Composition, r: ExportResult) {
-                    deferred.complete(true to "")
-                }
-                override fun onError(c: Composition, r: ExportResult, e: ExportException) {
-                    deferred.complete(false to (e.message ?: "unknown error"))
-                }
-            })
-            .build()
-
-        try {
-            transformer.start(composition, outputFile.absolutePath)
-        } catch (e: Exception) {
-            return@withContext false to (e.message ?: "failed to start")
+    private fun copyTempToOutput(ctx: Context, tempFile: File, outputUri: Uri): Boolean {
+        return try {
+            ctx.contentResolver.openOutputStream(outputUri, "wt")?.use { out ->
+                tempFile.inputStream().use { it.copyTo(out, bufferSize = 1024 * 1024) }
+                out.flush()
+            } != null
+        } catch (_: Exception) {
+            false
         }
+    }
 
-        val ph = ProgressHolder()
-        launch {
-            while (isActive && !deferred.isCompleted) {
-                val s = transformer.getProgress(ph)
-                if (s == Transformer.PROGRESS_STATE_AVAILABLE) {
-                    onProgress(ph.progress / 100f, "Media3 (re-encoding, slow)...")
-                }
-                delay(500)
-            }
-        }
-        deferred.await()
+    private fun createTempFile(ctx: Context): File {
+        val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        return File(ctx.cacheDir, "merge_temp_$timestamp.mp4")
     }
 }
