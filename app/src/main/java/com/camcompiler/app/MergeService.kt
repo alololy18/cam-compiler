@@ -30,6 +30,9 @@ class MergeService : Service() {
     var isRunning: Boolean = false
     var lastResult: MergeEngine.Result? = null
 
+    // The source URIs that were merged, so the UI can offer to delete them after success.
+    var lastSourceUris: List<Uri> = emptyList()
+
     var listener: ((Float, String, MergeEngine.Result?) -> Unit)? = null
 
     inner class LocalBinder : Binder() {
@@ -52,18 +55,18 @@ class MergeService : Service() {
 
         @Suppress("DEPRECATION")
         val urisStr = intent?.getStringArrayListExtra(EXTRA_URIS) ?: arrayListOf()
+        val outputUriStr = intent?.getStringExtra(EXTRA_OUTPUT_URI)
         val uris = urisStr.map { Uri.parse(it) }
-        if (uris.isEmpty()) {
+        val outputUri = outputUriStr?.let { Uri.parse(it) }
+
+        if (uris.isEmpty() || outputUri == null) {
             stopSelf()
             return START_NOT_STICKY
         }
 
-        // Use ServiceCompat.startForeground with type for Android 14+ compatibility
         val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-        } else {
-            0
-        }
+        } else 0
         ServiceCompat.startForeground(
             this,
             NOTIF_ID,
@@ -71,15 +74,16 @@ class MergeService : Service() {
             type
         )
 
-        startMerge(uris)
+        lastSourceUris = uris
+        startMerge(uris, outputUri)
         return START_NOT_STICKY
     }
 
-    private fun startMerge(uris: List<Uri>) {
+    private fun startMerge(uris: List<Uri>, outputUri: Uri) {
         if (isRunning) return
         isRunning = true
         currentJob = scope.launch {
-            val result = MergeEngine.merge(this@MergeService, uris) { p, s ->
+            val result = MergeEngine.merge(this@MergeService, uris, outputUri) { p, s ->
                 progress = p
                 status = s
                 listener?.invoke(p, s, null)
@@ -88,14 +92,17 @@ class MergeService : Service() {
             lastResult = result
             isRunning = false
             val finalMsg = when (result) {
-                is MergeEngine.Result.Success -> "Done! Saved to Downloads (${result.method})"
+                is MergeEngine.Result.Success -> {
+                    val mb = result.outputBytes / (1024.0 * 1024.0)
+                    val skip = if (result.skipped > 0) " (${result.skipped} skipped)" else ""
+                    "Done! ${"%.1f".format(mb)} MB via ${result.method}$skip"
+                }
                 is MergeEngine.Result.Failure -> "Failed: ${result.message}"
             }
             status = finalMsg
             progress = 1f
             listener?.invoke(1f, finalMsg, result)
             updateNotification(finalMsg, 1f, false)
-            // Brief delay so user sees the final notification, then stop foreground
             kotlinx.coroutines.delay(1500)
             ServiceCompat.stopForeground(this@MergeService, ServiceCompat.STOP_FOREGROUND_DETACH)
             stopSelf()
@@ -134,15 +141,11 @@ class MergeService : Service() {
             this, 0, openIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
-
-        val cancelIntent = Intent(this, MergeService::class.java).apply {
-            action = ACTION_CANCEL
-        }
+        val cancelIntent = Intent(this, MergeService::class.java).apply { action = ACTION_CANCEL }
         val cancelPi = PendingIntent.getService(
             this, 1, cancelIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
-
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Cam Compiler")
             .setContentText(text)
@@ -150,7 +153,6 @@ class MergeService : Service() {
             .setContentIntent(openPi)
             .setOngoing(ongoing)
             .setOnlyAlertOnce(true)
-
         if (ongoing) {
             builder.setProgress(100, (progress * 100).toInt(), progress < 0.01f)
             builder.addAction(0, "Cancel", cancelPi)
@@ -172,11 +174,13 @@ class MergeService : Service() {
         const val CHANNEL_ID = "merge_progress"
         const val NOTIF_ID = 1001
         const val EXTRA_URIS = "extra_uris"
+        const val EXTRA_OUTPUT_URI = "extra_output_uri"
         const val ACTION_CANCEL = "com.camcompiler.app.CANCEL"
 
-        fun start(ctx: Context, uris: List<Uri>) {
+        fun start(ctx: Context, uris: List<Uri>, outputUri: Uri) {
             val intent = Intent(ctx, MergeService::class.java).apply {
                 putStringArrayListExtra(EXTRA_URIS, ArrayList(uris.map { it.toString() }))
+                putExtra(EXTRA_OUTPUT_URI, outputUri.toString())
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 ctx.startForegroundService(intent)
