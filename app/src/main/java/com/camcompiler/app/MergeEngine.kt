@@ -1,11 +1,12 @@
 package com.camcompiler.app
 
-import android.content.ContentValues
 import android.content.Context
+import android.media.MediaCodec
+import android.media.MediaExtractor
+import android.media.MediaFormat
+import android.media.MediaMuxer
 import android.net.Uri
-import android.os.Build
-import android.os.Environment
-import android.provider.MediaStore
+import android.os.ParcelFileDescriptor
 import androidx.media3.common.MediaItem
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.transformer.Composition
@@ -23,43 +24,219 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.nio.ByteBuffer
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
 object MergeEngine {
 
+    private const val BUFFER_SIZE = 1024 * 1024
+
     sealed class Result {
-        data class Success(val outputName: String, val method: String) : Result()
+        data class Success(val method: String, val outputBytes: Long, val skipped: Int) : Result()
         data class Failure(val message: String) : Result()
     }
 
     /**
-     * Merges the given clips in order using Media3 Transformer.
-     * Reports progress via callback.
+     * Merges clipUris in the given order, writing the merged video to outputUri.
      */
     suspend fun merge(
         ctx: Context,
         clipUris: List<Uri>,
+        outputUri: Uri,
         onProgress: (Float, String) -> Unit
     ): Result = coroutineScope {
         if (clipUris.isEmpty()) return@coroutineScope Result.Failure("No clips to merge")
 
-        val outputFile = createTempOutputFile(ctx)
+        // Always produce to a temp file first, then copy to the chosen output URI.
+        val tempFile = createTempFile(ctx)
 
-        onProgress(0f, "Merging with Media3 (hardware-accelerated)...")
-        val (success, errorMsg) = tryMedia3(ctx, clipUris, outputFile, onProgress)
-        if (success) {
-            saveToDownloads(ctx, outputFile)
-            outputFile.delete()
-            return@coroutineScope Result.Success(outputFile.name, "Media3")
+        try {
+            // Tier 1: mp4parser
+            onProgress(0f, "Fast merge (mp4parser)...")
+            val mp4r = withContext(Dispatchers.IO) {
+                Mp4ParserMerger.merge(ctx, clipUris, tempFile) { p, s -> onProgress(p, s) }
+            }
+            if (mp4r.success) {
+                onProgress(0.95f, "Saving to chosen location...")
+                if (copyTempToOutput(ctx, tempFile, outputUri)) {
+                    return@coroutineScope Result.Success("mp4parser", tempFile.length(), mp4r.skippedCount)
+                }
+                return@coroutineScope Result.Failure("Merge succeeded but could not save to chosen location")
+            }
+            val mp4ParserError = mp4r.error
+            tempFile.delete()
+
+            // Tier 2: MediaMuxer
+            onProgress(0f, "Trying MediaMuxer fallback...")
+            val tempFile2 = createTempFile(ctx)
+            val muxResult = tryMediaMuxer(ctx, clipUris, tempFile2, onProgress)
+            if (muxResult.success) {
+                onProgress(0.95f, "Saving to chosen location...")
+                if (copyTempToOutput(ctx, tempFile2, outputUri)) {
+                    val r = Result.Success("MediaMuxer", tempFile2.length(), 0)
+                    tempFile2.delete()
+                    return@coroutineScope r
+                }
+                tempFile2.delete()
+                return@coroutineScope Result.Failure("Merge succeeded but could not save to chosen location")
+            }
+            val muxError = muxResult.error
+            tempFile2.delete()
+
+            // Tier 3: Media3 (slow re-encode possible)
+            onProgress(0f, "Trying Media3 fallback (slowest)...")
+            val tempFile3 = createTempFile(ctx)
+            val media3Result = tryMedia3(ctx, clipUris, tempFile3, onProgress)
+            if (media3Result.first) {
+                onProgress(0.95f, "Saving to chosen location...")
+                if (copyTempToOutput(ctx, tempFile3, outputUri)) {
+                    val r = Result.Success("Media3", tempFile3.length(), 0)
+                    tempFile3.delete()
+                    return@coroutineScope r
+                }
+                tempFile3.delete()
+                return@coroutineScope Result.Failure("Merge succeeded but could not save to chosen location")
+            }
+            tempFile3.delete()
+
+            return@coroutineScope Result.Failure(
+                "All three merge methods failed. mp4parser: $mp4ParserError. MediaMuxer: $muxError. Media3: ${media3Result.second}"
+            )
+        } finally {
+            tempFile.delete()
         }
-
-        outputFile.delete()
-        return@coroutineScope Result.Failure(
-            "Merge failed: $errorMsg. This usually means the clips have mismatched codecs/resolutions. Try fewer clips at a time to identify which one is problematic."
-        )
     }
+
+    private fun copyTempToOutput(ctx: Context, tempFile: File, outputUri: Uri): Boolean {
+        return try {
+            ctx.contentResolver.openOutputStream(outputUri, "w")?.use { out ->
+                tempFile.inputStream().use { it.copyTo(out, bufferSize = 1024 * 1024) }
+            } != null
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun createTempFile(ctx: Context): File {
+        val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        return File(ctx.cacheDir, "merge_temp_$timestamp.mp4")
+    }
+
+    // ===== Tier 2: MediaMuxer =====
+
+    private data class MuxResult(val success: Boolean, val error: String = "")
+
+    private suspend fun tryMediaMuxer(
+        ctx: Context,
+        clipUris: List<Uri>,
+        outputFile: File,
+        onProgress: (Float, String) -> Unit
+    ): MuxResult = withContext(Dispatchers.IO) {
+        var muxer: MediaMuxer? = null
+        var muxerStarted = false
+        var videoOutTrack = -1
+        var audioOutTrack = -1
+        var videoTimeOffsetUs = 0L
+        var audioTimeOffsetUs = 0L
+
+        try {
+            muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            val buffer = ByteBuffer.allocate(BUFFER_SIZE)
+
+            val firstExtractor = MediaExtractor()
+            val firstPfd = openPfd(ctx, clipUris[0])
+                ?: return@withContext MuxResult(false, "Could not open first clip")
+            try {
+                firstExtractor.setDataSource(firstPfd.fileDescriptor)
+                for (i in 0 until firstExtractor.trackCount) {
+                    val fmt = firstExtractor.getTrackFormat(i)
+                    val mime = fmt.getString(MediaFormat.KEY_MIME) ?: continue
+                    when {
+                        mime.startsWith("video/") && videoOutTrack < 0 -> videoOutTrack = muxer.addTrack(fmt)
+                        mime.startsWith("audio/") && audioOutTrack < 0 -> audioOutTrack = muxer.addTrack(fmt)
+                    }
+                }
+            } finally {
+                firstExtractor.release()
+                firstPfd.close()
+            }
+
+            if (videoOutTrack < 0) return@withContext MuxResult(false, "No video track in first clip")
+            muxer.start()
+            muxerStarted = true
+
+            for ((idx, uri) in clipUris.withIndex()) {
+                onProgress(idx.toFloat() / clipUris.size, "Copying clip ${idx + 1}/${clipUris.size}...")
+                val extractor = MediaExtractor()
+                val pfd = openPfd(ctx, uri) ?: continue
+                try {
+                    extractor.setDataSource(pfd.fileDescriptor)
+                    var clipVideoTrack = -1
+                    var clipAudioTrack = -1
+                    var maxV = 0L
+                    var maxA = 0L
+                    for (i in 0 until extractor.trackCount) {
+                        val fmt = extractor.getTrackFormat(i)
+                        val mime = fmt.getString(MediaFormat.KEY_MIME) ?: continue
+                        when {
+                            mime.startsWith("video/") && clipVideoTrack < 0 -> clipVideoTrack = i
+                            mime.startsWith("audio/") && clipAudioTrack < 0 -> clipAudioTrack = i
+                        }
+                    }
+                    if (clipVideoTrack >= 0) maxV = copyTrack(extractor, clipVideoTrack, muxer, videoOutTrack, videoTimeOffsetUs, buffer)
+                    if (clipAudioTrack >= 0 && audioOutTrack >= 0) maxA = copyTrack(extractor, clipAudioTrack, muxer, audioOutTrack, audioTimeOffsetUs, buffer)
+                    if (maxV > 0) videoTimeOffsetUs = maxV + 33_000
+                    if (maxA > 0) audioTimeOffsetUs = maxA + 23_000
+                } finally {
+                    extractor.release()
+                    pfd.close()
+                }
+            }
+            return@withContext MuxResult(true)
+        } catch (e: Exception) {
+            return@withContext MuxResult(false, e.message ?: "Unknown muxer error")
+        } finally {
+            try {
+                if (muxerStarted) muxer?.stop()
+                muxer?.release()
+            } catch (_: Exception) {}
+        }
+    }
+
+    private fun copyTrack(
+        extractor: MediaExtractor,
+        inputTrack: Int,
+        muxer: MediaMuxer,
+        outputTrack: Int,
+        offsetUs: Long,
+        buffer: ByteBuffer
+    ): Long {
+        extractor.selectTrack(inputTrack)
+        val info = MediaCodec.BufferInfo()
+        var maxTimeUs = 0L
+        while (true) {
+            buffer.clear()
+            val size = extractor.readSampleData(buffer, 0)
+            if (size < 0) break
+            info.size = size
+            info.offset = 0
+            info.presentationTimeUs = extractor.sampleTime + offsetUs
+            info.flags = extractor.sampleFlags
+            if (info.presentationTimeUs > maxTimeUs) maxTimeUs = info.presentationTimeUs
+            muxer.writeSampleData(outputTrack, buffer, info)
+            extractor.advance()
+        }
+        extractor.unselectTrack(inputTrack)
+        return maxTimeUs
+    }
+
+    private fun openPfd(ctx: Context, uri: Uri): ParcelFileDescriptor? = try {
+        ctx.contentResolver.openFileDescriptor(uri, "r")
+    } catch (_: Exception) { null }
+
+    // ===== Tier 3: Media3 =====
 
     @OptIn(UnstableApi::class)
     private suspend fun tryMedia3(
@@ -69,13 +246,8 @@ object MergeEngine {
         onProgress: (Float, String) -> Unit
     ): Pair<Boolean, String> = withContext(Dispatchers.Main) {
         val deferred = CompletableDeferred<Pair<Boolean, String>>()
-
-        val mediaItems = clipUris.map { uri ->
-            EditedMediaItem.Builder(MediaItem.fromUri(uri)).build()
-        }
-        // Media3 1.4.1 API: use the List constructor directly
+        val mediaItems = clipUris.map { EditedMediaItem.Builder(MediaItem.fromUri(it)).build() }
         val sequence = EditedMediaItemSequence(mediaItems)
-        // Composition.Builder needs explicit cast to disambiguate the overload
         val composition: Composition = Composition.Builder(listOf(sequence)).build()
 
         val transformer = Transformer.Builder(ctx)
@@ -84,7 +256,7 @@ object MergeEngine {
                     deferred.complete(true to "")
                 }
                 override fun onError(c: Composition, r: ExportResult, e: ExportException) {
-                    deferred.complete(false to (e.message ?: "unknown export error"))
+                    deferred.complete(false to (e.message ?: "unknown error"))
                 }
             })
             .build()
@@ -92,51 +264,19 @@ object MergeEngine {
         try {
             transformer.start(composition, outputFile.absolutePath)
         } catch (e: Exception) {
-            return@withContext false to (e.message ?: "failed to start transformer")
+            return@withContext false to (e.message ?: "failed to start")
         }
 
-        // Poll progress on a separate coroutine
-        val progressHolder = ProgressHolder()
+        val ph = ProgressHolder()
         launch {
             while (isActive && !deferred.isCompleted) {
-                val state = transformer.getProgress(progressHolder)
-                if (state == Transformer.PROGRESS_STATE_AVAILABLE) {
-                    onProgress(progressHolder.progress / 100f, "Merging... (Media3)")
+                val s = transformer.getProgress(ph)
+                if (s == Transformer.PROGRESS_STATE_AVAILABLE) {
+                    onProgress(ph.progress / 100f, "Media3 (re-encoding, slow)...")
                 }
                 delay(500)
             }
         }
-
         deferred.await()
-    }
-
-    private fun createTempOutputFile(ctx: Context): File {
-        val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-        return File(ctx.cacheDir, "vlog_$timestamp.mp4")
-    }
-
-    private fun saveToDownloads(ctx: Context, sourceFile: File) {
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val values = ContentValues().apply {
-                    put(MediaStore.Downloads.DISPLAY_NAME, sourceFile.name)
-                    put(MediaStore.Downloads.MIME_TYPE, "video/mp4")
-                    put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
-                }
-                val uri = ctx.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-                uri?.let {
-                    ctx.contentResolver.openOutputStream(it)?.use { out ->
-                        sourceFile.inputStream().use { input -> input.copyTo(out) }
-                    }
-                }
-            } else {
-                val downloads = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-                if (!downloads.exists()) downloads.mkdirs()
-                val dest = File(downloads, sourceFile.name)
-                sourceFile.copyTo(dest, overwrite = true)
-            }
-        } catch (e: Exception) {
-            // best-effort save
-        }
     }
 }
