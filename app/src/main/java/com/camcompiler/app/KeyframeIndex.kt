@@ -57,30 +57,51 @@ object KeyframeIndex {
         }
     }
 
+    /** Maximum distance to snap (in ms). If no keyframe is within this window of
+     *  the requested time, the requested time is returned unchanged. This prevents
+     *  surprising large jumps when the user drags far past the keyframe range
+     *  (e.g. into very-end-of-clip territory that the keyframe index didn't reach). */
+    private const val SNAP_WINDOW_MS = 1500L
+
     /**
      * Given a list of sorted keyframe timestamps and a requested time (ms),
      * return the closest keyframe at or before the requested time. Used for
      * trim-start so we never lose frames at the beginning.
+     *
+     * Safe-snap behavior: if the chosen keyframe is more than SNAP_WINDOW_MS
+     * before the requested value, returns requestedMs instead. This prevents
+     * "snap back to start" when no keyframe is anywhere near the user's choice.
      */
     fun nearestKeyframeAtOrBefore(keyframes: List<Long>, requestedMs: Long): Long {
         if (keyframes.isEmpty()) return requestedMs
-        var best = keyframes[0]
+        var best: Long? = null
         for (kf in keyframes) {
             if (kf <= requestedMs) best = kf else break
         }
-        return best
+        if (best == null) return requestedMs
+        // Don't snap further than SNAP_WINDOW_MS backward
+        return if (requestedMs - best > SNAP_WINDOW_MS) requestedMs else best
     }
 
     /**
      * For trim-end, we want the closest keyframe at or AFTER the requested
      * end time, so the trimmed range includes all frames up to that point.
-     * Falls back to the last keyframe if requested is past the end.
+     *
+     * Safe-snap behavior: if no keyframe exists at or after the requested value
+     * (i.e. user dragged past the last keyframe), returns requestedMs unchanged.
+     * If the next keyframe is more than SNAP_WINDOW_MS away, also returns
+     * requestedMs unchanged. Previously this returned keyframes.last() which
+     * could cause a surprising jump backward by many seconds.
      */
     fun nearestKeyframeAtOrAfter(keyframes: List<Long>, requestedMs: Long): Long {
         if (keyframes.isEmpty()) return requestedMs
         for (kf in keyframes) {
-            if (kf >= requestedMs) return kf
+            if (kf >= requestedMs) {
+                // Don't snap further than SNAP_WINDOW_MS forward
+                return if (kf - requestedMs > SNAP_WINDOW_MS) requestedMs else kf
+            }
         }
-        return keyframes.last()
+        // No keyframe at or after — user dragged past the indexed range. Don't snap.
+        return requestedMs
     }
 }
