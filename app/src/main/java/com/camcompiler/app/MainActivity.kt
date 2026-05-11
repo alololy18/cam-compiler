@@ -768,6 +768,109 @@ private fun TopBar(
     }
 }
 
+// ============================ Manage bar (reused by task screens) ============================
+
+/**
+ * Shared manage UI used by Merge, Edit, and Audio screens.
+ *
+ * Layout:
+ *  - Always shows: "Manage" chip + count summary
+ *  - When manage mode is on AND items are selected: shows "X selected" + Clear/Delete
+ *  - Handles the delete confirmation dialog internally
+ *
+ * Entering manage mode clears any existing non-manage selections.
+ * Exiting manage mode clears the manage selection.
+ */
+@Composable
+private fun ManageBar(vm: MainViewModel) {
+    var showDeleteConfirm by remember { mutableStateOf(false) }
+    var pendingDeleteUris by remember { mutableStateOf<List<Uri>>(emptyList()) }
+
+    Column(modifier = Modifier.fillMaxWidth()) {
+        // Top row: count + refresh + manage chip
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                "${vm.clips.size} clip(s)  •  ${formatDuration(vm.totalAllDuration())}  •  ${"%.0f".format(vm.totalAllSizeMb())} MB",
+                fontSize = 13.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onBackground,
+                modifier = Modifier.weight(1f)
+            )
+            IconButton(onClick = { vm.refreshFolder() }) {
+                Icon(Icons.Filled.Refresh, "Rescan folder")
+            }
+            FilterChip(
+                selected = vm.manageMode,
+                onClick = {
+                    vm.manageMode = !vm.manageMode
+                    vm.clearSelection()
+                },
+                label = { Text(if (vm.manageMode) "Done" else "Manage", fontSize = 12.sp) },
+                modifier = Modifier.padding(start = 4.dp)
+            )
+        }
+
+        // Manage delete bar — only visible in manage mode with items selected
+        if (vm.manageMode && vm.selectionOrder.isNotEmpty() && !vm.isProcessing) {
+            Spacer(Modifier.height(8.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    "${vm.selectionOrder.size} selected for deletion",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.weight(1f)
+                )
+                OutlinedButton(onClick = { vm.clearSelection() }) { Text("Clear") }
+                Spacer(Modifier.width(8.dp))
+                Button(
+                    onClick = {
+                        pendingDeleteUris = vm.selectionOrder.toList()
+                        showDeleteConfirm = true
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.error
+                    )
+                ) {
+                    Icon(Icons.Filled.Delete, null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text("Delete")
+                }
+            }
+        }
+    }
+
+    // Delete confirmation dialog
+    if (showDeleteConfirm && pendingDeleteUris.isNotEmpty()) {
+        AlertDialog(
+            onDismissRequest = { showDeleteConfirm = false },
+            icon = { Icon(Icons.Filled.Warning, null, tint = MaterialTheme.colorScheme.error) },
+            title = { Text("Delete ${pendingDeleteUris.size} clip(s)?") },
+            text = { Text("This permanently removes the files. This cannot be undone.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    val urisToDel = pendingDeleteUris
+                    showDeleteConfirm = false
+                    pendingDeleteUris = emptyList()
+                    vm.deleteClips(urisToDel)
+                    // Exit manage mode after delete
+                    vm.manageMode = false
+                }) {
+                    Text("Delete", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDeleteConfirm = false }) { Text("Cancel") }
+            }
+        )
+    }
+}
+
 // ============================ Hub screen ============================
 
 @Composable
@@ -989,39 +1092,14 @@ private fun MergeScreen(
     onCancelMerge: () -> Unit
 ) {
     val context = LocalContext.current
-    var showDeleteConfirm by remember { mutableStateOf(false) }
-    var pendingDeleteUris by remember { mutableStateOf<List<Uri>>(emptyList()) }
 
     Column(
         modifier = Modifier
             .fillMaxSize()
             .padding(horizontal = 16.dp, vertical = 12.dp)
     ) {
-        // Header: clip count + manage toggle + refresh
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(
-                "${vm.clips.size} clip(s)  •  ${formatDuration(vm.totalAllDuration())}  •  ${"%.0f".format(vm.totalAllSizeMb())} MB",
-                fontSize = 13.sp,
-                fontWeight = FontWeight.SemiBold,
-                color = MaterialTheme.colorScheme.onBackground,
-                modifier = Modifier.weight(1f)
-            )
-            IconButton(onClick = { vm.refreshFolder() }) {
-                Icon(Icons.Filled.Refresh, "Rescan folder")
-            }
-            FilterChip(
-                selected = vm.manageMode,
-                onClick = {
-                    vm.manageMode = !vm.manageMode
-                    if (!vm.manageMode) vm.clearSelection()
-                },
-                label = { Text(if (vm.manageMode) "Done" else "Manage", fontSize = 12.sp) },
-                modifier = Modifier.padding(start = 4.dp)
-            )
-        }
+        // Shared manage bar (clip count + refresh + Manage chip + delete bar when active)
+        ManageBar(vm = vm)
 
         // Sort info
         vm.lastSortInfo?.let { si ->
@@ -1069,36 +1147,6 @@ private fun MergeScreen(
                 Icon(Icons.Filled.AutoAwesome, null, modifier = Modifier.size(18.dp))
                 Spacer(Modifier.width(8.dp))
                 Text("Merge selected clips")
-            }
-        }
-
-        // Manage-mode delete bar
-        if (vm.manageMode && vm.selectionOrder.isNotEmpty() && !vm.isProcessing) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    "${vm.selectionOrder.size} selected for deletion",
-                    fontSize = 12.sp,
-                    color = MaterialTheme.colorScheme.error,
-                    modifier = Modifier.weight(1f)
-                )
-                OutlinedButton(onClick = { vm.clearSelection() }) { Text("Clear") }
-                Spacer(Modifier.width(8.dp))
-                Button(
-                    onClick = {
-                        pendingDeleteUris = vm.selectionOrder.toList()
-                        showDeleteConfirm = true
-                    },
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = MaterialTheme.colorScheme.error
-                    )
-                ) {
-                    Icon(Icons.Filled.Delete, null, modifier = Modifier.size(16.dp))
-                    Spacer(Modifier.width(4.dp))
-                    Text("Delete")
-                }
             }
         }
 
@@ -1162,29 +1210,6 @@ private fun MergeScreen(
         }
     }
 
-    // Delete confirmation
-    if (showDeleteConfirm && pendingDeleteUris.isNotEmpty()) {
-        AlertDialog(
-            onDismissRequest = { showDeleteConfirm = false },
-            icon = { Icon(Icons.Filled.Warning, null, tint = MaterialTheme.colorScheme.error) },
-            title = { Text("Delete ${pendingDeleteUris.size} clip(s)?") },
-            text = { Text("This permanently removes the files. This cannot be undone.") },
-            confirmButton = {
-                TextButton(onClick = {
-                    val urisToDel = pendingDeleteUris
-                    showDeleteConfirm = false
-                    pendingDeleteUris = emptyList()
-                    vm.deleteClips(urisToDel)
-                }) {
-                    Text("Delete", color = MaterialTheme.colorScheme.error)
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showDeleteConfirm = false }) { Text("Cancel") }
-            }
-        )
-    }
-
     // Post-merge prompt to delete source clips
     if (vm.showDeletePromptAfterMerge && vm.postMergeSourceUris.isNotEmpty()) {
         AlertDialog(
@@ -1221,9 +1246,15 @@ private fun EditScreen(vm: MainViewModel) {
             .fillMaxSize()
             .padding(horizontal = 16.dp, vertical = 12.dp)
     ) {
+        // Shared manage bar
+        ManageBar(vm = vm)
+
+        Spacer(Modifier.height(8.dp))
+
         Text(
-            "Pick a clip to edit (trim, multi-range cuts)",
-            fontSize = 13.sp,
+            if (vm.manageMode) "Select clips to delete, or tap Done to exit manage mode"
+            else "Tap a clip to trim (or use Manage to delete clips)",
+            fontSize = 12.sp,
             color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.7f)
         )
 
@@ -1234,9 +1265,15 @@ private fun EditScreen(vm: MainViewModel) {
                 ClipRow(
                     clip = clip,
                     clipEdit = vm.getEditForClip(clip.uri),
-                    selectionIndex = null,
-                    manageMode = false,
-                    onClick = { vm.trimmingClipUri = clip.uri },
+                    selectionIndex = if (vm.manageMode)
+                        vm.selectionOrder.indexOf(clip.uri).takeIf { it >= 0 }
+                    else null,
+                    manageMode = vm.manageMode,
+                    showTrimIcon = !vm.manageMode,
+                    onClick = {
+                        if (vm.manageMode) vm.toggleSelection(clip.uri)
+                        else vm.trimmingClipUri = clip.uri
+                    },
                     onPlayClick = { playVideo(context, clip.uri) },
                     onTrimClick = { vm.trimmingClipUri = clip.uri }
                 )
@@ -1260,17 +1297,24 @@ private fun AudioScreen(
             .fillMaxSize()
             .padding(horizontal = 16.dp, vertical = 12.dp)
     ) {
+        // Shared manage bar
+        ManageBar(vm = vm)
+
+        Spacer(Modifier.height(8.dp))
+
         Text(
-            "Pick clip(s), then add background music. Output is a single re-encoded video.",
+            if (vm.manageMode) "Select clips to delete, or tap Done to exit manage mode"
+            else "Pick clip(s), then add background music. Output is a single re-encoded video.",
             fontSize = 12.sp,
             color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.7f)
         )
 
         Spacer(Modifier.height(12.dp))
 
-        MusicChip(vm = vm, musicPicker = musicPicker)
-
-        Spacer(Modifier.height(12.dp))
+        if (!vm.manageMode) {
+            MusicChip(vm = vm, musicPicker = musicPicker)
+            Spacer(Modifier.height(12.dp))
+        }
 
         LazyColumn(
             modifier = Modifier.weight(1f),
@@ -1281,7 +1325,8 @@ private fun AudioScreen(
                     clip = clip,
                     clipEdit = vm.getEditForClip(clip.uri),
                     selectionIndex = vm.selectionOrder.indexOf(clip.uri).takeIf { it >= 0 },
-                    manageMode = false,
+                    manageMode = vm.manageMode,
+                    showTrimIcon = false,
                     onClick = { vm.toggleSelection(clip.uri) },
                     onPlayClick = { playVideo(context, clip.uri) },
                     onTrimClick = { vm.trimmingClipUri = clip.uri }
@@ -1289,7 +1334,7 @@ private fun AudioScreen(
             }
         }
 
-        if (vm.selectionOrder.isNotEmpty() && vm.musicUri != null && !vm.isProcessing) {
+        if (!vm.manageMode && vm.selectionOrder.isNotEmpty() && vm.musicUri != null && !vm.isProcessing) {
             Spacer(Modifier.height(8.dp))
             Button(
                 onClick = { onStartSaveAs(vm.selectionOrder) },
@@ -1382,9 +1427,10 @@ fun ClipRow(
     clipEdit: ClipEdit,
     selectionIndex: Int?,
     manageMode: Boolean,
+    showTrimIcon: Boolean = false,
     onClick: () -> Unit,
     onPlayClick: () -> Unit,
-    onTrimClick: () -> Unit
+    onTrimClick: () -> Unit = {}
 ) {
     val isSelected = selectionIndex != null
     val borderColor = when {
@@ -1432,7 +1478,7 @@ fun ClipRow(
                     else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
             )
         }
-        if (!manageMode) {
+        if (showTrimIcon && !manageMode) {
             IconButton(onClick = onTrimClick, modifier = Modifier.size(36.dp)) {
                 Icon(
                     Icons.Filled.ContentCut,
