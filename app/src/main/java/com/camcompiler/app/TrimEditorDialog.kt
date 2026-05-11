@@ -534,49 +534,75 @@ private fun MultiRegionScrubber(
                 val startXDp = with(density) { msToX(r.startMs).toDp() }
                 val endXDp = with(density) { msToX(r.endMs).toDp() }
 
-                // Start handle
+                // Start handle — smooth drag, snap on release
+                var startDragMs by remember(sel, ranges) { mutableStateOf(r.startMs) }
                 Box(
                     modifier = Modifier
-                        .offset(x = startXDp - 14.dp, y = 6.dp)
-                        .width(28.dp)
-                        .height(44.dp)
+                        .offset(x = startXDp - 24.dp, y = 4.dp)
+                        .width(48.dp)
+                        .height(48.dp)
                         .pointerInput(sel, ranges) {
-                            detectDragGestures { _, dragAmount ->
-                                val deltaMs = xToMs(dragAmount.x)
-                                val newStart = snapStart((r.startMs + deltaMs).coerceIn(0L, r.endMs - 100L))
-                                onRangeUpdate(sel, TrimRange(newStart, r.endMs))
-                            }
+                            detectDragGestures(
+                                onDragStart = { startDragMs = r.startMs },
+                                onDragEnd = {
+                                    val snapped = snapStart(startDragMs)
+                                    onRangeUpdate(sel, TrimRange(
+                                        snapped.coerceIn(0L, r.endMs - 100L),
+                                        r.endMs
+                                    ))
+                                },
+                                onDragCancel = { },
+                                onDrag = { _, dragAmount ->
+                                    val deltaMs = xToMs(dragAmount.x)
+                                    val newStart = (startDragMs + deltaMs).coerceIn(0L, r.endMs - 100L)
+                                    startDragMs = newStart
+                                    onRangeUpdate(sel, TrimRange(newStart, r.endMs))
+                                }
+                            )
                         }
                 ) {
                     Box(
                         modifier = Modifier
                             .align(Alignment.Center)
-                            .width(8.dp)
-                            .height(44.dp)
+                            .width(10.dp)
+                            .height(48.dp)
                             .clip(RoundedCornerShape(4.dp))
                             .background(rangeColor)
                     )
                 }
 
-                // End handle
+                // End handle — smooth drag, snap on release
+                var endDragMs by remember(sel, ranges) { mutableStateOf(r.endMs) }
                 Box(
                     modifier = Modifier
-                        .offset(x = endXDp - 14.dp, y = 6.dp)
-                        .width(28.dp)
-                        .height(44.dp)
+                        .offset(x = endXDp - 24.dp, y = 4.dp)
+                        .width(48.dp)
+                        .height(48.dp)
                         .pointerInput(sel, ranges) {
-                            detectDragGestures { _, dragAmount ->
-                                val deltaMs = xToMs(dragAmount.x)
-                                val newEnd = snapEnd((r.endMs + deltaMs).coerceIn(r.startMs + 100L, durationMs))
-                                onRangeUpdate(sel, TrimRange(r.startMs, newEnd))
-                            }
+                            detectDragGestures(
+                                onDragStart = { endDragMs = r.endMs },
+                                onDragEnd = {
+                                    val snapped = snapEnd(endDragMs)
+                                    onRangeUpdate(sel, TrimRange(
+                                        r.startMs,
+                                        snapped.coerceIn(r.startMs + 100L, durationMs)
+                                    ))
+                                },
+                                onDragCancel = { },
+                                onDrag = { _, dragAmount ->
+                                    val deltaMs = xToMs(dragAmount.x)
+                                    val newEnd = (endDragMs + deltaMs).coerceIn(r.startMs + 100L, durationMs)
+                                    endDragMs = newEnd
+                                    onRangeUpdate(sel, TrimRange(r.startMs, newEnd))
+                                }
+                            )
                         }
                 ) {
                     Box(
                         modifier = Modifier
                             .align(Alignment.Center)
-                            .width(8.dp)
-                            .height(44.dp)
+                            .width(10.dp)
+                            .height(48.dp)
                             .clip(RoundedCornerShape(4.dp))
                             .background(rangeColor)
                     )
