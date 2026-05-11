@@ -56,16 +56,40 @@ object MergeEngine {
             // Tier 1: mp4parser
             onProgress(0f, "Fast merge (mp4parser)...")
             val mp4r = withContext(Dispatchers.IO) {
-                Mp4ParserMerger.merge(ctx, clipUris, tempFile) { p, s -> onProgress(p, s) }
+                Mp4ParserMerger.merge(ctx, clipUris, tempFile) { p, s -> onProgress(p * 0.7f, s) }
             }
             if (mp4r.success) {
-                onProgress(0.95f, "Saving to chosen location...")
-                if (copyTempToOutput(ctx, tempFile, outputUri)) {
-                    return@coroutineScope Result.Success("mp4parser", tempFile.length(), mp4r.skippedCount)
+                // mp4parser may produce non-standard MP4 atoms that some video players reject
+                // (even though MediaExtractor can parse them). Always re-mux through MediaMuxer
+                // for guaranteed compatibility. This step is fast — just copies streams.
+                onProgress(0.72f, "Re-muxing for compatibility...")
+                val remuxFile = createTempFile(ctx)
+                val remuxResult = tryMediaMuxer(ctx, listOf(Uri.fromFile(tempFile)), remuxFile) { p, s ->
+                    onProgress(0.72f + (p * 0.20f), "Compatibility pass: $s")
                 }
-                return@coroutineScope Result.Failure("Merge succeeded but could not save to chosen location")
+                if (remuxResult.success && withContext(Dispatchers.IO) { isPlayable(remuxFile) }) {
+                    onProgress(0.95f, "Saving to chosen location...")
+                    if (copyTempToOutput(ctx, remuxFile, outputUri)) {
+                        val r = Result.Success("mp4parser+compat", remuxFile.length(), mp4r.skippedCount)
+                        remuxFile.delete()
+                        return@coroutineScope r
+                    }
+                    remuxFile.delete()
+                    return@coroutineScope Result.Failure("Merge succeeded but could not save to chosen location")
+                }
+                // Compatibility re-mux failed. Fall back to direct mp4parser output but warn.
+                remuxFile.delete()
+                if (withContext(Dispatchers.IO) { isPlayable(tempFile) }) {
+                    onProgress(0.95f, "Saving (compatibility pass skipped)...")
+                    if (copyTempToOutput(ctx, tempFile, outputUri)) {
+                        return@coroutineScope Result.Success("mp4parser-raw", tempFile.length(), mp4r.skippedCount)
+                    }
+                    return@coroutineScope Result.Failure("Merge succeeded but could not save to chosen location")
+                }
+                // Output not playable at all — fall through to MediaMuxer-from-scratch
+                onProgress(0.0f, "mp4parser output unusable — re-merging with MediaMuxer...")
             }
-            val mp4ParserError = mp4r.error
+            val mp4ParserError = if (mp4r.success) "Output not playable" else mp4r.error
             tempFile.delete()
 
             // Tier 2: MediaMuxer
@@ -109,10 +133,29 @@ object MergeEngine {
         }
     }
 
+    /** Returns true if Android's MediaExtractor can parse the file as playable video. */
+    private fun isPlayable(file: File): Boolean {
+        return try {
+            val extractor = MediaExtractor()
+            extractor.setDataSource(file.absolutePath)
+            var hasVideo = false
+            for (i in 0 until extractor.trackCount) {
+                val mime = extractor.getTrackFormat(i).getString(MediaFormat.KEY_MIME) ?: continue
+                if (mime.startsWith("video/")) { hasVideo = true; break }
+            }
+            extractor.release()
+            hasVideo
+        } catch (_: Exception) {
+            false
+        }
+    }
+
     private fun copyTempToOutput(ctx: Context, tempFile: File, outputUri: Uri): Boolean {
         return try {
-            ctx.contentResolver.openOutputStream(outputUri, "w")?.use { out ->
+            // "wt" = write+truncate, ensures we don't leave stale bytes if the new file is shorter
+            ctx.contentResolver.openOutputStream(outputUri, "wt")?.use { out ->
                 tempFile.inputStream().use { it.copyTo(out, bufferSize = 1024 * 1024) }
+                out.flush()
             } != null
         } catch (_: Exception) {
             false
