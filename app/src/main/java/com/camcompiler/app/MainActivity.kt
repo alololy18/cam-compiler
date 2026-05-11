@@ -31,6 +31,7 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.PlayCircle
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.*
@@ -67,6 +68,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     var postMergeSourceUris by mutableStateOf<List<Uri>>(emptyList())
     var showDeletePromptAfterMerge by mutableStateOf(false)
+    var lastMergedOutputUri by mutableStateOf<Uri?>(null)
 
     // Files that look like videos by extension but failed validation.
     // Held pending user decision to ignore or include them anyway.
@@ -102,6 +104,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             if (savePref) Prefs.setLastFolder(getApplication(), uri.toString())
             scanFolder(uri)
         }
+    }
+
+    /** Re-scan the currently-loaded folder to pick up new/deleted files. */
+    fun refresh() {
+        val uri = folderUri ?: return
+        viewModelScope.launch { scanFolder(uri) }
     }
 
     private suspend fun scanFolder(uri: Uri) {
@@ -326,6 +334,8 @@ class MainActivity : ComponentActivity() {
                         Toast.makeText(this@MainActivity,
                             "Saved! ${"%.1f".format(result.outputBytes / 1024.0 / 1024.0)} MB",
                             Toast.LENGTH_LONG).show()
+                        // Refresh folder in case the merged file was saved into it
+                        vm.refresh()
                         val srcUris = mergeService?.lastSourceUris ?: emptyList()
                         if (srcUris.isNotEmpty()) {
                             vm.postMergeSourceUris = srcUris
@@ -386,6 +396,7 @@ class MainActivity : ComponentActivity() {
         vm.isProcessing = true
         vm.progress = 0f
         vm.status = "Starting..."
+        vm.lastMergedOutputUri = outputUri
         MergeService.start(this, uris, outputUri)
         bindService(Intent(this, MergeService::class.java), connection, Context.BIND_AUTO_CREATE)
     }
@@ -443,6 +454,16 @@ fun AppScreen(
                         Spacer(Modifier.width(4.dp))
                         Text(it, fontSize = 12.sp, color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.7f))
                     }
+                }
+            }
+            if (vm.folderUri != null) {
+                IconButton(
+                    onClick = { vm.refresh() },
+                    enabled = !vm.isProcessing,
+                    modifier = Modifier.size(36.dp)
+                ) {
+                    Icon(Icons.Filled.Refresh, "Refresh folder",
+                        modifier = Modifier.size(18.dp))
                 }
             }
             if (vm.clips.isNotEmpty()) {
@@ -539,6 +560,40 @@ fun AppScreen(
             }
         }
 
+        // Show a "play last merged" banner if there's a recent output and not currently processing
+        if (!vm.isProcessing && vm.lastMergedOutputUri != null) {
+            Spacer(Modifier.height(8.dp))
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.4f))
+                    .clickable { vm.lastMergedOutputUri?.let { playVideo(context, it) } }
+                    .padding(horizontal = 10.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    Icons.Filled.PlayCircle, null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(20.dp)
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    "Tap to play the merged video",
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.weight(1f),
+                    color = MaterialTheme.colorScheme.onPrimaryContainer
+                )
+                TextButton(
+                    onClick = { vm.lastMergedOutputUri = null },
+                    contentPadding = PaddingValues(8.dp, 0.dp)
+                ) {
+                    Text("Dismiss", fontSize = 11.sp)
+                }
+            }
+        }
+
         Spacer(Modifier.height(12.dp))
 
         if (vm.manageMode && !vm.isProcessing) {
@@ -573,7 +628,8 @@ fun AppScreen(
                     clip = clip,
                     selectionIndex = vm.selectionOrder.indexOf(clip.uri).takeIf { it >= 0 },
                     manageMode = vm.manageMode,
-                    onClick = { if (!vm.isProcessing) vm.toggleSelection(clip.uri) }
+                    onClick = { if (!vm.isProcessing) vm.toggleSelection(clip.uri) },
+                    onPlayClick = { playVideo(context, clip.uri) }
                 )
             }
         }
@@ -703,7 +759,13 @@ fun AppScreen(
 }
 
 @Composable
-fun ClipRow(clip: VideoClip, selectionIndex: Int?, manageMode: Boolean, onClick: () -> Unit) {
+fun ClipRow(
+    clip: VideoClip,
+    selectionIndex: Int?,
+    manageMode: Boolean,
+    onClick: () -> Unit,
+    onPlayClick: () -> Unit
+) {
     val isSelected = selectionIndex != null
     val borderColor = when {
         manageMode && isSelected -> MaterialTheme.colorScheme.error
@@ -722,21 +784,23 @@ fun ClipRow(clip: VideoClip, selectionIndex: Int?, manageMode: Boolean, onClick:
             .background(bgColor)
             .border(2.dp, borderColor, RoundedCornerShape(8.dp))
             .clickable { onClick() }
-            .padding(horizontal = 10.dp, vertical = 8.dp),
+            .padding(start = 4.dp, end = 10.dp, top = 4.dp, bottom = 4.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        val icon = when {
-            manageMode && isSelected -> Icons.Filled.Delete
-            isSelected -> Icons.Filled.CheckCircle
-            else -> Icons.Filled.PlayCircle
+        // Play icon — always shown, always clickable (regardless of mode).
+        // Tapping it opens the clip in the system video player rather than selecting.
+        IconButton(
+            onClick = onPlayClick,
+            modifier = Modifier.size(40.dp)
+        ) {
+            Icon(
+                Icons.Filled.PlayCircle,
+                contentDescription = "Play in system video player",
+                tint = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.size(28.dp)
+            )
         }
-        val iconTint = when {
-            manageMode && isSelected -> MaterialTheme.colorScheme.error
-            isSelected -> MaterialTheme.colorScheme.primary
-            else -> MaterialTheme.colorScheme.onSurfaceVariant
-        }
-        Icon(icon, null, tint = iconTint, modifier = Modifier.size(28.dp))
-        Spacer(Modifier.width(10.dp))
+        Spacer(Modifier.width(4.dp))
         Column(modifier = Modifier.weight(1f)) {
             Text(clip.name, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, maxLines = 1)
             Text(
@@ -745,16 +809,54 @@ fun ClipRow(clip: VideoClip, selectionIndex: Int?, manageMode: Boolean, onClick:
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
-        if (selectionIndex != null && !manageMode) {
-            Box(
-                modifier = Modifier.size(24.dp).clip(RoundedCornerShape(12.dp))
-                    .background(MaterialTheme.colorScheme.primary),
-                contentAlignment = Alignment.Center
-            ) {
-                Text("${selectionIndex + 1}",
-                    color = MaterialTheme.colorScheme.onPrimary,
-                    fontWeight = FontWeight.Bold, fontSize = 11.sp)
+        // Right-side indicator: depends on mode + selection
+        when {
+            manageMode && isSelected -> {
+                Icon(
+                    Icons.Filled.Delete,
+                    null,
+                    tint = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.size(24.dp)
+                )
+            }
+            !manageMode && isSelected && selectionIndex != null -> {
+                Box(
+                    modifier = Modifier.size(24.dp).clip(RoundedCornerShape(12.dp))
+                        .background(MaterialTheme.colorScheme.primary),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text("${selectionIndex + 1}",
+                        color = MaterialTheme.colorScheme.onPrimary,
+                        fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                }
+            }
+            else -> {
+                // Empty space placeholder to keep layout consistent
+                Spacer(Modifier.size(24.dp))
             }
         }
+    }
+}
+
+/**
+ * Open the given video URI in the system's default video player.
+ * Uses ACTION_VIEW; Android shows a chooser if multiple players are installed.
+ */
+fun playVideo(context: android.content.Context, uri: Uri) {
+    try {
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, "video/*")
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        val chooser = Intent.createChooser(intent, "Play video with...")
+        chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        context.startActivity(chooser)
+    } catch (e: Exception) {
+        Toast.makeText(
+            context,
+            "No video player found. Install a video player from Play Store.",
+            Toast.LENGTH_LONG
+        ).show()
     }
 }
