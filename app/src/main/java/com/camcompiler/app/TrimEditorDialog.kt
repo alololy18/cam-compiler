@@ -69,6 +69,7 @@ fun TrimEditorDialog(
     var ranges by remember { mutableStateOf(initialEdit.ranges) }
     var trimMode by remember { mutableStateOf(initialEdit.mode) }
     var playOrder by remember { mutableStateOf(initialEdit.playOrder) }
+    var rangeTransitions by remember { mutableStateOf(initialEdit.rangeTransitions) }
     var selectedRangeIdx by remember { mutableStateOf<Int?>(null) }
 
     // Export preview state: when true, we're in the preview-before-commit overlay
@@ -168,7 +169,8 @@ fun TrimEditorDialog(
                                 sourceUri = clip.uri,
                                 ranges = ranges,
                                 mode = trimMode,
-                                playOrder = playOrder
+                                playOrder = playOrder,
+                                rangeTransitions = rangeTransitions
                             ))
                         },
                         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
@@ -380,6 +382,7 @@ fun TrimEditorDialog(
                             ranges = ranges,
                             trimMode = trimMode,
                             playOrder = playOrder,
+                            rangeTransitions = rangeTransitions,
                             selectedIdx = selectedRangeIdx,
                             onSelect = { selectedRangeIdx = it },
                             onDelete = { idx ->
@@ -388,6 +391,20 @@ fun TrimEditorDialog(
                                 playOrder = playOrder
                                     .filter { it != idx }
                                     .map { if (it > idx) it - 1 else it }
+                                // Shift rangeTransitions to match. The transition at position N is
+                                // between range N and N+1. When deleting range idx:
+                                //  - if idx == 0: drop transition 0 (between old #0 and old #1)
+                                //  - if idx == last: drop transition idx-1 (between old #idx-1 and old #idx)
+                                //  - else: drop transition at idx (between old #idx and old #idx+1)
+                                //    This keeps transition[idx-1] joining new ranges [idx-1] and [idx].
+                                if (rangeTransitions.isNotEmpty()) {
+                                    val dropAt = if (idx == 0) 0
+                                        else if (idx >= rangeTransitions.size) rangeTransitions.size - 1
+                                        else idx
+                                    rangeTransitions = rangeTransitions.toMutableList().also {
+                                        it.removeAt(dropAt)
+                                    }
+                                }
                                 if (selectedRangeIdx == idx) selectedRangeIdx = null
                                 else if (selectedRangeIdx != null && selectedRangeIdx!! > idx) {
                                     selectedRangeIdx = selectedRangeIdx!! - 1
@@ -410,6 +427,16 @@ fun TrimEditorDialog(
                                     newOrder[pos] = newOrder[pos + 1].also { newOrder[pos + 1] = newOrder[pos] }
                                     playOrder = newOrder
                                 }
+                            },
+                            onTransitionCycle = { displayPos, newT ->
+                                // Ensure rangeTransitions has enough slots: ranges.size - 1
+                                val needed = (ranges.size - 1).coerceAtLeast(0)
+                                val current = rangeTransitions.toMutableList()
+                                while (current.size < needed) current.add(Transition.NONE)
+                                if (displayPos in current.indices) {
+                                    current[displayPos] = newT
+                                }
+                                rangeTransitions = current
                             }
                         )
                     } else {
@@ -525,9 +552,9 @@ fun TrimEditorDialog(
             if (showExportPreview) {
                 ExportPreviewOverlay(
                     clip = clip,
-                    edit = ClipEdit(clip.uri, ranges, trimMode, playOrder),
+                    edit = ClipEdit(clip.uri, ranges, trimMode, playOrder, rangeTransitions),
                     onConfirm = {
-                        val finalEdit = ClipEdit(clip.uri, ranges, trimMode, playOrder)
+                        val finalEdit = ClipEdit(clip.uri, ranges, trimMode, playOrder, rangeTransitions)
                         showExportPreview = false
                         onExport(finalEdit)
                     },
@@ -852,11 +879,13 @@ private fun RangeListVertical(
     ranges: List<TrimRange>,
     trimMode: TrimMode,
     playOrder: List<Int>,
+    rangeTransitions: List<Transition>,
     selectedIdx: Int?,
     onSelect: (Int) -> Unit,
     onDelete: (Int) -> Unit,
     onMoveUp: (Int) -> Unit,
-    onMoveDown: (Int) -> Unit
+    onMoveDown: (Int) -> Unit,
+    onTransitionCycle: (Int, Transition) -> Unit
 ) {
     val isCutMode = trimMode == TrimMode.REMOVE_RANGES
     val displayOrder = if (trimMode == TrimMode.KEEP_RANGES && playOrder.isNotEmpty())
@@ -933,6 +962,22 @@ private fun RangeListVertical(
                         "Delete range",
                         tint = MaterialTheme.colorScheme.error,
                         modifier = Modifier.size(18.dp)
+                    )
+                }
+            }
+
+            // Transition pill between this range and the next (only between, not after last)
+            if (displayPos < displayOrder.size - 1) {
+                val currentTransition = rangeTransitions.getOrElse(displayPos) { Transition.NONE }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 1.dp),
+                    horizontalArrangement = Arrangement.Center
+                ) {
+                    TransitionPill(
+                        current = currentTransition,
+                        onCycle = { newT -> onTransitionCycle(displayPos, newT) }
                     )
                 }
             }
