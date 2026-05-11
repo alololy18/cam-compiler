@@ -852,6 +852,26 @@ private fun RangeWithHandles(
     var startDragOffsetMs by remember { mutableStateOf<Long?>(null) }
     var endDragOffsetMs by remember { mutableStateOf<Long?>(null) }
 
+    // CRITICAL: pointerInput's lambda captures variables by closure at the time the
+    // gesture detector is established. The pointerInput key (`isStartHandle`) is
+    // constant, so the lambda is NEVER refreshed across recompositions.
+    //
+    // That means `rangeStartMs` / `rangeEndMs` captured directly would be STALE —
+    // stuck at whatever value they had when the lambda was first created. After
+    // committing a drag, the parent recomposes with new range bounds, but the
+    // pointerInput's lambda still uses the OLD bounds. Clamping uses stale bounds,
+    // and the commit value is computed against the stale baseline — producing
+    // "jumps to zero" / "won't extend past N" bugs.
+    //
+    // Fix: route prop access through rememberUpdatedState. The State object is
+    // stable across recompositions and its `.value` is always the latest.
+    val rangeStartMsState = rememberUpdatedState(rangeStartMs)
+    val rangeEndMsState = rememberUpdatedState(rangeEndMs)
+    val durationMsState = rememberUpdatedState(durationMs)
+    val onStartCommitState = rememberUpdatedState(onStartCommit)
+    val onEndCommitState = rememberUpdatedState(onEndCommit)
+    val onSelectOnlyState = rememberUpdatedState(onSelectOnly)
+
     // Compute render positions
     val renderStartMs = if (startDragOffsetMs != null) {
         (rangeStartMs + startDragOffsetMs!!).coerceIn(0L, rangeEndMs - 100L)
@@ -901,23 +921,24 @@ private fun RangeWithHandles(
         isStartHandle = true,
         onDragStart = {
             startDragOffsetMs = 0L
-            onSelectOnly()  // select range without toggling
+            onSelectOnlyState.value()  // select range without toggling
         },
         onDragDelta = { deltaPx ->
             val deltaMs = xToMs(deltaPx)
             val current = startDragOffsetMs ?: 0L
-            // Clamp the offset so the resulting position stays within valid bounds.
-            // This prevents the "sticky" feeling where the offset runs far past
-            // the limits during a fast drag and then has to come all the way back.
+            // Read LATEST range bounds from State references (stable across recomp)
+            val rs = rangeStartMsState.value
+            val re = rangeEndMsState.value
             val proposed = current + deltaMs
-            val minOffset = -rangeStartMs  // can't go below 0
-            val maxOffset = (rangeEndMs - 100L) - rangeStartMs  // can't cross end - 100ms
+            val minOffset = -rs
+            val maxOffset = (re - 100L) - rs
             startDragOffsetMs = proposed.coerceIn(minOffset, maxOffset)
         },
         onDragEndCommit = {
             val finalOffset = startDragOffsetMs ?: 0L
             startDragOffsetMs = null
-            onStartCommit(rangeStartMs + finalOffset)
+            // Commit using the LATEST rangeStartMs, not the stale captured one
+            onStartCommitState.value(rangeStartMsState.value + finalOffset)
         }
     )
 
@@ -929,20 +950,24 @@ private fun RangeWithHandles(
         isStartHandle = false,
         onDragStart = {
             endDragOffsetMs = 0L
-            onSelectOnly()
+            onSelectOnlyState.value()
         },
         onDragDelta = { deltaPx ->
             val deltaMs = xToMs(deltaPx)
             val current = endDragOffsetMs ?: 0L
+            val rs = rangeStartMsState.value
+            val re = rangeEndMsState.value
+            val dur = durationMsState.value
             val proposed = current + deltaMs
-            val minOffset = (rangeStartMs + 100L) - rangeEndMs  // can't go below start + 100ms
-            val maxOffset = durationMs - rangeEndMs  // can't go past clip duration
+            val minOffset = (rs + 100L) - re
+            val maxOffset = dur - re
             endDragOffsetMs = proposed.coerceIn(minOffset, maxOffset)
         },
         onDragEndCommit = {
             val finalOffset = endDragOffsetMs ?: 0L
             endDragOffsetMs = null
-            onEndCommit(rangeEndMs + finalOffset)
+            // Commit using the LATEST rangeEndMs
+            onEndCommitState.value(rangeEndMsState.value + finalOffset)
         }
     )
 }
