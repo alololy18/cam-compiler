@@ -35,10 +35,25 @@ data class ClipEdit(
      * If empty, ranges play in source (time) order.
      * For REMOVE_RANGES: order is always source order; this field is unused.
      */
-    val playOrder: List<Int> = emptyList()
+    val playOrder: List<Int> = emptyList(),
+    /**
+     * Transitions BETWEEN adjacent effective ranges. Position N is the transition
+     * from segment N to segment N+1. Should have effectiveRanges.size - 1 elements;
+     * if shorter, missing positions default to Transition.NONE.
+     */
+    val rangeTransitions: List<Transition> = emptyList()
 ) {
     /** True if any non-default edit applies to this clip. */
     fun hasEdits(): Boolean = ranges.isNotEmpty()
+
+    /** True if any transition between ranges is non-NONE. */
+    fun hasTransitions(): Boolean = rangeTransitions.any { it != Transition.NONE }
+
+    /**
+     * Returns the transition at position N, or NONE if out of bounds.
+     */
+    fun transitionAt(idx: Int): Transition =
+        rangeTransitions.getOrElse(idx) { Transition.NONE }
 
     /**
      * Resolves to a list of TrimRanges that the merge engine should output,
