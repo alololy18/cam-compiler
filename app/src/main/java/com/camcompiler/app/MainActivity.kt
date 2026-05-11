@@ -24,17 +24,21 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.ContentCut
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.PlayCircle
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.SwapHoriz
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.*
@@ -61,7 +65,7 @@ import java.util.Locale
 
 class MainViewModel(app: Application) : AndroidViewModel(app) {
     // Hub-and-spoke navigation state
-    enum class Screen { HUB, MERGE, EDIT, AUDIO }
+    enum class Screen { HUB, MERGE, MERGE_PRO, EDIT, AUDIO }
     var currentScreen by mutableStateOf(Screen.HUB)
 
     var folderUri by mutableStateOf<Uri?>(null); private set
@@ -78,13 +82,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     var showDeletePromptAfterMerge by mutableStateOf(false)
     var lastMergedOutputUri by mutableStateOf<Uri?>(null)
 
-    // Files that look like videos by extension but failed validation.
-    // Held pending user decision to ignore or include them anyway.
     data class ExcludedFile(val uri: Uri, val name: String, val sizeMb: Double, val reason: String)
     var pendingExclusions by mutableStateOf<List<ExcludedFile>>(emptyList())
     var showExclusionPrompt by mutableStateOf(false)
 
-    // Mismatch dialog state — appears when ClipAnalyzer detects clips that differ.
     var pendingMismatches by mutableStateOf<List<ClipAnalyzer.Mismatch>>(emptyList())
     var pendingMergeUrisForDialog by mutableStateOf<List<Uri>>(emptyList())
     var showMismatchDialog by mutableStateOf(false)
@@ -98,6 +99,36 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     var musicName by mutableStateOf<String?>(null)
     var musicVolume by mutableStateOf(0.5f)
     var originalAudioVolume by mutableStateOf(1.0f)
+
+    // ===== Merge Pro state (the new transition-aware Merge tile) =====
+    // Transitions between adjacent SELECTED clips. Length = selectionOrder.size - 1.
+    // Stored as a map keyed by (from clip URI -> to clip URI) so the value survives
+    // selection reorderings; we materialize a list at merge time.
+    var mergeProTransitions by mutableStateOf<Map<Pair<Uri, Uri>, Transition>>(emptyMap())
+        private set
+
+    fun setMergeProTransition(fromUri: Uri, toUri: Uri, t: Transition) {
+        mergeProTransitions = if (t == Transition.NONE) {
+            mergeProTransitions - (fromUri to toUri)
+        } else {
+            mergeProTransitions + ((fromUri to toUri) to t)
+        }
+    }
+
+    fun getMergeProTransition(fromUri: Uri, toUri: Uri): Transition =
+        mergeProTransitions[fromUri to toUri] ?: Transition.NONE
+
+    fun clearMergeProTransitions() {
+        mergeProTransitions = emptyMap()
+    }
+
+    /** Materialized transition list for the current selectionOrder. */
+    fun materializeMergeProTransitions(uris: List<Uri>): List<Transition> {
+        if (uris.size < 2) return emptyList()
+        return (0 until uris.size - 1).map { i ->
+            getMergeProTransition(uris[i], uris[i + 1])
+        }
+    }
 
     // Trim dialog state — which clip URI is being trimmed (null = not open)
     var trimmingClipUri by mutableStateOf<Uri?>(null)
@@ -118,14 +149,27 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun getEditForClip(uri: Uri): ClipEdit =
         clipEdits[uri] ?: ClipEdit(uri)
 
-    /** Builds the EditProject for the given selected clip URIs. */
-    fun buildEditProject(selectedUris: List<Uri>): EditProject {
+    /**
+     * Builds the EditProject for the given selected clip URIs.
+     * @param includeTransitions if true, includes mergeProTransitions and forceReencode (for Merge Pro)
+     * @param includeMusic if true, includes the music URI (for Audio + Merge Pro)
+     */
+    fun buildEditProject(
+        selectedUris: List<Uri>,
+        includeTransitions: Boolean = false,
+        includeMusic: Boolean = true,
+        forceReencode: Boolean = false
+    ): EditProject {
         val edits = selectedUris.map { getEditForClip(it) }
         return EditProject(
             clipEdits = edits,
-            musicUri = musicUri,
+            musicUri = if (includeMusic) musicUri else null,
             musicVolume = musicVolume,
-            originalAudioVolume = originalAudioVolume
+            originalAudioVolume = originalAudioVolume,
+            clipTransitions = if (includeTransitions)
+                materializeMergeProTransitions(selectedUris)
+            else emptyList(),
+            forceReencode = forceReencode
         )
     }
 
@@ -469,21 +513,65 @@ class MainActivity : ComponentActivity() {
             val analysis = withContext(Dispatchers.IO) {
                 ClipAnalyzer.analyze(this@MainActivity, uris, names)
             }
-            val project = vm.buildEditProject(uris)
+            // Per-screen project build:
+            //   MERGE_PRO -> include transitions + forceReencode (always slow path)
+            //   AUDIO     -> include music
+            //   MERGE     -> bulk merge, no music/transitions
+            //   EDIT      -> single-clip export from trim dialog, includes that clip's edits
+            val project = when (vm.currentScreen) {
+                MainViewModel.Screen.MERGE_PRO -> vm.buildEditProject(
+                    uris,
+                    includeTransitions = true,
+                    includeMusic = true,
+                    forceReencode = true
+                )
+                MainViewModel.Screen.AUDIO -> vm.buildEditProject(
+                    uris,
+                    includeTransitions = false,
+                    includeMusic = true,
+                    forceReencode = false
+                )
+                MainViewModel.Screen.MERGE -> vm.buildEditProject(
+                    uris,
+                    includeTransitions = false,
+                    includeMusic = false,
+                    forceReencode = false
+                )
+                else -> vm.buildEditProject(
+                    uris,
+                    includeTransitions = false,
+                    includeMusic = false,
+                    forceReencode = false
+                )
+            }
 
             // Decide mode based on what's in the project + analysis
             val musicPresent = project.hasMusic()
             val codecMixed = analysis is ClipAnalyzer.AnalysisResult.Mixed
-
-            // Check if any trim is non-keyframe-aligned (forces re-encode).
-            // For simplicity, treat any clip with non-default trim as potentially non-aligned
-            // unless we verify by loading its keyframe index. To keep this responsive,
-            // we trust that the trim dialog snapped to keyframes when user chose "snap" mode.
-            // The reliable check is: if a clip has edits AND musicPresent is false AND
-            // codecs match, try FAST; if MediaMuxer fails (due to non-alignment), it returns an error
-            // and we surface to the user.
+            val hasTransitions = project.hasClipTransitions() || project.hasAnyRangeTransitions()
+            val forceReencode = project.forceReencode
 
             when {
+                forceReencode || hasTransitions -> {
+                    // New Merge tile (with transitions) — always re-encode
+                    val reasons = mutableListOf<String>()
+                    if (hasTransitions) reasons += "Transitions: " +
+                        listOfNotNull(
+                            "${project.clipTransitions.count { it != Transition.NONE }} between clips".takeIf { project.hasClipTransitions() },
+                            "${project.clipEdits.sumOf { it.rangeTransitions.count { rt -> rt != Transition.NONE } }} within clips".takeIf { project.hasAnyRangeTransitions() }
+                        ).joinToString(", ")
+                    if (project.hasMusic()) reasons += "Music: ${vm.musicName ?: "audio"}"
+                    reasons += "Re-encoding required (slower, ~15-30 min for 2.5GB)"
+                    vm.status = "Re-encoding required for this merge."
+                    vm.pendingMergeUrisForDialog = uris
+                    vm.pendingMismatches = listOf(
+                        ClipAnalyzer.Mismatch(
+                            clipName = if (hasTransitions) "Merge with transitions" else "Music added",
+                            differences = reasons
+                        )
+                    )
+                    vm.showMismatchDialog = true
+                }
                 musicPresent -> {
                     // Music always requires re-encode — show informational confirm
                     vm.status = "Music will require re-encoding (slower)."
@@ -507,7 +595,7 @@ class MainActivity : ComponentActivity() {
                     vm.showMismatchDialog = true
                 }
                 else -> {
-                    // Uniform codecs, no music — fast path
+                    // Uniform codecs, no music, no transitions — fast path
                     vm.status = if (project.hasClipEdits()) "Clips trimmed — fast merge."
                         else "Clips are uniform — fast merge."
                     pendingMode = MergeEngine.Mode.FAST
@@ -547,7 +635,33 @@ class MainActivity : ComponentActivity() {
         vm.progress = 0f
         vm.status = "Starting (${if (mode == MergeEngine.Mode.FAST) "Fast" else "Compatible"} mode)..."
         vm.lastMergedOutputUri = outputUri
-        val project = vm.buildEditProject(uris)
+        // Build project consistent with the screen that initiated the merge
+        val project = when (vm.currentScreen) {
+            MainViewModel.Screen.MERGE_PRO -> vm.buildEditProject(
+                uris,
+                includeTransitions = true,
+                includeMusic = true,
+                forceReencode = true
+            )
+            MainViewModel.Screen.AUDIO -> vm.buildEditProject(
+                uris,
+                includeTransitions = false,
+                includeMusic = true,
+                forceReencode = false
+            )
+            MainViewModel.Screen.MERGE -> vm.buildEditProject(
+                uris,
+                includeTransitions = false,
+                includeMusic = false,
+                forceReencode = false
+            )
+            else -> vm.buildEditProject(
+                uris,
+                includeTransitions = false,
+                includeMusic = false,
+                forceReencode = false
+            )
+        }
         MergeService.start(this, project, outputUri, mode)
         bindService(Intent(this, MergeService::class.java), connection, Context.BIND_AUTO_CREATE)
     }
@@ -610,6 +724,12 @@ fun AppScreen(
                 onSelectTask = { task -> vm.currentScreen = task }
             )
             MainViewModel.Screen.MERGE -> MergeScreen(
+                vm = vm,
+                musicPicker = musicPicker,
+                onStartSaveAs = onStartSaveAs,
+                onCancelMerge = onCancelMerge
+            )
+            MainViewModel.Screen.MERGE_PRO -> MergeProScreen(
                 vm = vm,
                 musicPicker = musicPicker,
                 onStartSaveAs = onStartSaveAs,
@@ -743,7 +863,8 @@ private fun TopBar(
 ) {
     val title = when (screen) {
         MainViewModel.Screen.HUB -> "Cam Compiler"
-        MainViewModel.Screen.MERGE -> "Merge Clips"
+        MainViewModel.Screen.MERGE -> "Bulk Merge"
+        MainViewModel.Screen.MERGE_PRO -> "Merge"
         MainViewModel.Screen.EDIT -> "Edit Clip"
         MainViewModel.Screen.AUDIO -> "Replace Audio"
     }
@@ -959,13 +1080,26 @@ private fun HubScreen(
                 horizontalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 TaskTile(
-                    icon = Icons.Filled.AutoAwesome,
-                    label = "Merge",
-                    sublabel = "Combine clips",
+                    icon = Icons.Filled.Bolt,
+                    label = "Bulk Merge",
+                    sublabel = "Fast, lossless",
                     enabled = hasFolder,
                     modifier = Modifier.weight(1f),
                     onClick = { onSelectTask(MainViewModel.Screen.MERGE) }
                 )
+                TaskTile(
+                    icon = Icons.Filled.Movie,
+                    label = "Merge",
+                    sublabel = "With transitions",
+                    enabled = hasFolder,
+                    modifier = Modifier.weight(1f),
+                    onClick = { onSelectTask(MainViewModel.Screen.MERGE_PRO) }
+                )
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
                 TaskTile(
                     icon = Icons.Filled.ContentCut,
                     label = "Edit",
@@ -983,7 +1117,6 @@ private fun HubScreen(
                     onClick = { onSelectTask(MainViewModel.Screen.AUDIO) }
                 )
             }
-            // Empty placeholder row for future features
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(12.dp)
@@ -991,14 +1124,6 @@ private fun HubScreen(
                 TaskTile(
                     icon = Icons.Filled.Tune,
                     label = "Filters",
-                    sublabel = "Coming soon",
-                    enabled = false,
-                    modifier = Modifier.weight(1f),
-                    onClick = { }
-                )
-                TaskTile(
-                    icon = Icons.Filled.AutoAwesome,
-                    label = "Highlights",
                     sublabel = "Coming soon",
                     enabled = false,
                     modifier = Modifier.weight(1f),
@@ -1241,6 +1366,247 @@ private fun MergeScreen(
                 TextButton(onClick = { vm.dismissDeletePrompt() }) { Text("Keep") }
             }
         )
+    }
+}
+
+// ============================ Transition pill (shared) ============================
+
+/**
+ * A small interactive pill showing the current transition state.
+ * Tap cycles through None → Fade → Hold → None.
+ *
+ * Used between adjacent clips in Merge Pro and between ranges in Trim.
+ */
+@Composable
+fun TransitionPill(
+    current: Transition,
+    onCycle: (Transition) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val isActive = current != Transition.NONE
+    val containerColor = if (isActive) MaterialTheme.colorScheme.secondaryContainer
+        else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+    val contentColor = if (isActive) MaterialTheme.colorScheme.onSecondaryContainer
+        else MaterialTheme.colorScheme.onSurfaceVariant
+    val borderColor = if (isActive) MaterialTheme.colorScheme.secondary
+        else MaterialTheme.colorScheme.outline.copy(alpha = 0.3f)
+
+    Row(
+        modifier = modifier
+            .clip(RoundedCornerShape(14.dp))
+            .background(containerColor)
+            .border(
+                width = if (isActive) 1.5.dp else 1.dp,
+                color = borderColor,
+                shape = RoundedCornerShape(14.dp)
+            )
+            .clickable { onCycle(current.next()) }
+            .padding(horizontal = 10.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(
+            Icons.Filled.SwapHoriz,
+            null,
+            tint = contentColor,
+            modifier = Modifier.size(14.dp)
+        )
+        Spacer(Modifier.width(4.dp))
+        Text(
+            current.shortLabel,
+            fontSize = 11.sp,
+            fontWeight = if (isActive) FontWeight.SemiBold else FontWeight.Normal,
+            color = contentColor
+        )
+    }
+}
+
+// ============================ Merge Pro screen (new) ============================
+
+@Composable
+private fun MergeProScreen(
+    vm: MainViewModel,
+    musicPicker: androidx.activity.compose.ManagedActivityResultLauncher<Array<String>, Uri?>,
+    onStartSaveAs: (List<Uri>) -> Unit,
+    onCancelMerge: () -> Unit
+) {
+    val context = LocalContext.current
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 16.dp, vertical = 12.dp)
+    ) {
+        // Shared manage bar
+        ManageBar(vm = vm)
+
+        Spacer(Modifier.height(8.dp))
+
+        Text(
+            if (vm.manageMode) "Select clips to delete, or tap Done to exit manage mode"
+            else "Pick clips, add transitions between them, then produce a re-encoded video.",
+            fontSize = 12.sp,
+            color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.7f)
+        )
+
+        Spacer(Modifier.height(8.dp))
+
+        if (!vm.manageMode) {
+            // Music chip (optional)
+            MusicChip(vm = vm, musicPicker = musicPicker)
+            Spacer(Modifier.height(8.dp))
+
+            // Re-encode notice
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.4f)
+                )
+            ) {
+                Row(modifier = Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        Icons.Filled.Warning,
+                        null,
+                        tint = MaterialTheme.colorScheme.tertiary,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        "Always re-encodes (~15-30 min for 2.5GB). For fast lossless merge, use Bulk Merge.",
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onTertiaryContainer
+                    )
+                }
+            }
+            Spacer(Modifier.height(10.dp))
+        }
+
+        // Clip list with transition pills between rows
+        LazyColumn(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            // Show selected clips (in selection order) at the top with pills between them
+            val selectedUris = vm.selectionOrder
+            val unselectedClips = vm.clips.filter { it.uri !in selectedUris }
+
+            if (selectedUris.isNotEmpty() && !vm.manageMode) {
+                item {
+                    Text(
+                        "In merge (${selectedUris.size}):",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.7f),
+                        modifier = Modifier.padding(vertical = 4.dp)
+                    )
+                }
+                itemsIndexed(selectedUris) { idx, uri ->
+                    val clip = vm.clips.firstOrNull { it.uri == uri } ?: return@itemsIndexed
+                    Column {
+                        ClipRow(
+                            clip = clip,
+                            clipEdit = vm.getEditForClip(clip.uri),
+                            selectionIndex = idx,
+                            manageMode = false,
+                            showTrimIcon = false,
+                            onClick = { vm.toggleSelection(clip.uri) },
+                            onPlayClick = { playVideo(context, clip.uri) },
+                            onTrimClick = { vm.trimmingClipUri = clip.uri }
+                        )
+                        // Transition pill between this clip and the next
+                        if (idx < selectedUris.size - 1) {
+                            val nextUri = selectedUris[idx + 1]
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 2.dp),
+                                horizontalArrangement = Arrangement.Center
+                            ) {
+                                TransitionPill(
+                                    current = vm.getMergeProTransition(uri, nextUri),
+                                    onCycle = { newT -> vm.setMergeProTransition(uri, nextUri, newT) }
+                                )
+                            }
+                        }
+                    }
+                }
+                item { Spacer(Modifier.height(8.dp)) }
+            }
+
+            // Available clips
+            if (unselectedClips.isNotEmpty() || vm.manageMode) {
+                item {
+                    Text(
+                        if (vm.manageMode) "All clips:"
+                        else "Available clips (tap to add):",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.7f),
+                        modifier = Modifier.padding(vertical = 4.dp)
+                    )
+                }
+                items(if (vm.manageMode) vm.clips else unselectedClips) { clip ->
+                    ClipRow(
+                        clip = clip,
+                        clipEdit = vm.getEditForClip(clip.uri),
+                        selectionIndex = if (vm.manageMode)
+                            vm.selectionOrder.indexOf(clip.uri).takeIf { it >= 0 }
+                        else null,
+                        manageMode = vm.manageMode,
+                        showTrimIcon = false,
+                        onClick = {
+                            if (vm.manageMode) vm.toggleSelection(clip.uri)
+                            else vm.toggleSelection(clip.uri)
+                        },
+                        onPlayClick = { playVideo(context, clip.uri) },
+                        onTrimClick = { vm.trimmingClipUri = clip.uri }
+                    )
+                }
+            }
+        }
+
+        // Produce button
+        if (!vm.manageMode && vm.selectionOrder.size >= 2 && !vm.isProcessing) {
+            Spacer(Modifier.height(8.dp))
+            Button(
+                onClick = { onStartSaveAs(vm.selectionOrder) },
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.secondary,
+                    contentColor = MaterialTheme.colorScheme.onSecondary
+                )
+            ) {
+                Icon(Icons.Filled.Movie, null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("Produce merged video (${vm.selectionOrder.size} clips)")
+            }
+        } else if (!vm.manageMode && vm.selectionOrder.size == 1) {
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "Select at least 2 clips to merge",
+                fontSize = 11.sp,
+                color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f),
+                modifier = Modifier.fillMaxWidth(),
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center
+            )
+        }
+
+        // Processing indicator (mirrors MergeScreen's)
+        if (vm.isProcessing) {
+            Spacer(Modifier.height(12.dp))
+            LinearProgressIndicator(
+                progress = { vm.progress.coerceIn(0f, 1f) },
+                modifier = Modifier.fillMaxWidth(),
+                color = MaterialTheme.colorScheme.primary
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(vm.status, fontSize = 11.sp, modifier = Modifier.weight(1f))
+                TextButton(onClick = onCancelMerge) { Text("Cancel") }
+            }
+        }
     }
 }
 
