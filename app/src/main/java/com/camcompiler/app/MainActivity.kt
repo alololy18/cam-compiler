@@ -735,7 +735,7 @@ fun AppScreen(
                 onStartSaveAs = onStartSaveAs,
                 onCancelMerge = onCancelMerge
             )
-            MainViewModel.Screen.EDIT -> EditScreen(vm = vm)
+            MainViewModel.Screen.EDIT -> EditScreen(vm = vm, onCancelMerge = onCancelMerge)
             MainViewModel.Screen.AUDIO -> AudioScreen(
                 vm = vm,
                 musicPicker = musicPicker,
@@ -821,6 +821,31 @@ fun AppScreen(
             },
             confirmButton = { TextButton(onClick = { onConfirmReencode() }) { Text("Re-encode and merge") } },
             dismissButton = { TextButton(onClick = { onCancelMismatch() }) { Text("Cancel") } }
+        )
+    }
+
+    // Post-merge complete prompt — shows on any screen when merge finishes
+    if (vm.showDeletePromptAfterMerge && vm.postMergeSourceUris.isNotEmpty()) {
+        AlertDialog(
+            onDismissRequest = { vm.dismissDeletePrompt() },
+            icon = { Icon(Icons.Filled.CheckCircle, null, tint = MaterialTheme.colorScheme.primary) },
+            title = { Text("Merge complete") },
+            text = {
+                Text("Delete the ${vm.postMergeSourceUris.size} source clip(s) used for this merge? " +
+                     "The merged output is preserved.")
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val toDel = vm.postMergeSourceUris.toList()
+                    vm.dismissDeletePrompt()
+                    vm.deleteClips(toDel)
+                }) {
+                    Text("Delete sources", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { vm.dismissDeletePrompt() }) { Text("Keep") }
+            }
         )
     }
 
@@ -997,6 +1022,37 @@ private fun ManageBar(vm: MainViewModel) {
                 TextButton(onClick = { showDeleteConfirm = false }) { Text("Cancel") }
             }
         )
+    }
+}
+
+// ============================ Processing progress bar (shared) ============================
+
+/**
+ * Shared progress UI shown by any task screen while a merge/export is running.
+ * Renders only if vm.isProcessing == true.
+ */
+@Composable
+private fun ProcessingBar(vm: MainViewModel, onCancel: () -> Unit) {
+    if (!vm.isProcessing) return
+    Column(modifier = Modifier.fillMaxWidth()) {
+        LinearProgressIndicator(
+            progress = { vm.progress.coerceIn(0f, 1f) },
+            modifier = Modifier.fillMaxWidth(),
+            color = MaterialTheme.colorScheme.primary
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                vm.status,
+                fontSize = 11.sp,
+                color = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.weight(1f)
+            )
+            TextButton(onClick = onCancel) { Text("Cancel") }
+        }
     }
 }
 
@@ -1343,30 +1399,8 @@ private fun MergeScreen(
         }
     }
 
-    // Post-merge prompt to delete source clips
-    if (vm.showDeletePromptAfterMerge && vm.postMergeSourceUris.isNotEmpty()) {
-        AlertDialog(
-            onDismissRequest = { vm.dismissDeletePrompt() },
-            icon = { Icon(Icons.Filled.CheckCircle, null, tint = MaterialTheme.colorScheme.primary) },
-            title = { Text("Merge complete") },
-            text = {
-                Text("Delete the ${vm.postMergeSourceUris.size} source clip(s) used for this merge? " +
-                     "The merged output is preserved.")
-            },
-            confirmButton = {
-                TextButton(onClick = {
-                    val toDel = vm.postMergeSourceUris.toList()
-                    vm.dismissDeletePrompt()
-                    vm.deleteClips(toDel)
-                }) {
-                    Text("Delete sources", color = MaterialTheme.colorScheme.error)
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { vm.dismissDeletePrompt() }) { Text("Keep") }
-            }
-        )
-    }
+    // Post-merge prompt to delete source clips is handled at the AppScreen level
+    // (hoisted so it appears regardless of which screen the user is on)
 }
 
 // ============================ Transition pill (shared) ============================
@@ -1613,7 +1647,10 @@ private fun MergeProScreen(
 // ============================ Edit screen ============================
 
 @Composable
-private fun EditScreen(vm: MainViewModel) {
+private fun EditScreen(
+    vm: MainViewModel,
+    onCancelMerge: () -> Unit
+) {
     val context = LocalContext.current
     Column(
         modifier = Modifier
@@ -1634,7 +1671,10 @@ private fun EditScreen(vm: MainViewModel) {
 
         Spacer(Modifier.height(12.dp))
 
-        LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        LazyColumn(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
             items(vm.clips) { clip ->
                 ClipRow(
                     clip = clip,
@@ -1643,8 +1683,9 @@ private fun EditScreen(vm: MainViewModel) {
                         vm.selectionOrder.indexOf(clip.uri).takeIf { it >= 0 }
                     else null,
                     manageMode = vm.manageMode,
-                    showTrimIcon = !vm.manageMode,
+                    showTrimIcon = !vm.manageMode && !vm.isProcessing,
                     onClick = {
+                        if (vm.isProcessing) return@ClipRow
                         if (vm.manageMode) vm.toggleSelection(clip.uri)
                         else vm.trimmingClipUri = clip.uri
                     },
@@ -1652,6 +1693,11 @@ private fun EditScreen(vm: MainViewModel) {
                     onTrimClick = { vm.trimmingClipUri = clip.uri }
                 )
             }
+        }
+
+        if (vm.isProcessing) {
+            Spacer(Modifier.height(12.dp))
+            ProcessingBar(vm = vm, onCancel = onCancelMerge)
         }
     }
 }
