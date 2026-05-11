@@ -789,7 +789,13 @@ private fun RangeWithHandles(
         onDragDelta = { deltaPx ->
             val deltaMs = xToMs(deltaPx)
             val current = startDragOffsetMs ?: 0L
-            startDragOffsetMs = current + deltaMs
+            // Clamp the offset so the resulting position stays within valid bounds.
+            // This prevents the "sticky" feeling where the offset runs far past
+            // the limits during a fast drag and then has to come all the way back.
+            val proposed = current + deltaMs
+            val minOffset = -rangeStartMs  // can't go below 0
+            val maxOffset = (rangeEndMs - 100L) - rangeStartMs  // can't cross end - 100ms
+            startDragOffsetMs = proposed.coerceIn(minOffset, maxOffset)
         },
         onDragEndCommit = {
             val finalOffset = startDragOffsetMs ?: 0L
@@ -811,7 +817,10 @@ private fun RangeWithHandles(
         onDragDelta = { deltaPx ->
             val deltaMs = xToMs(deltaPx)
             val current = endDragOffsetMs ?: 0L
-            endDragOffsetMs = current + deltaMs
+            val proposed = current + deltaMs
+            val minOffset = (rangeStartMs + 100L) - rangeEndMs  // can't go below start + 100ms
+            val maxOffset = durationMs - rangeEndMs  // can't go past clip duration
+            endDragOffsetMs = proposed.coerceIn(minOffset, maxOffset)
         },
         onDragEndCommit = {
             val finalOffset = endDragOffsetMs ?: 0L
