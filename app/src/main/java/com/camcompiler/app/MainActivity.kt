@@ -47,6 +47,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -75,6 +76,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     data class ExcludedFile(val uri: Uri, val name: String, val sizeMb: Double, val reason: String)
     var pendingExclusions by mutableStateOf<List<ExcludedFile>>(emptyList())
     var showExclusionPrompt by mutableStateOf(false)
+
+    // Mismatch dialog state — appears when ClipAnalyzer detects clips that differ.
+    var pendingMismatches by mutableStateOf<List<ClipAnalyzer.Mismatch>>(emptyList())
+    var pendingMergeUrisForDialog by mutableStateOf<List<Uri>>(emptyList())
+    var showMismatchDialog by mutableStateOf(false)
 
     init {
         loadLastFolder()
@@ -311,14 +317,16 @@ class MainActivity : ComponentActivity() {
     private val vm: MainViewModel by viewModels()
     private var mergeService: MergeService? = null
     private var pendingMergeUris: List<Uri> = emptyList()
+    private var pendingMode: MergeEngine.Mode = MergeEngine.Mode.FAST
 
     private val saveAsLauncher = registerForActivityResult(
         ActivityResultContracts.CreateDocument("video/mp4")
     ) { destUri ->
         if (destUri != null && pendingMergeUris.isNotEmpty()) {
-            startMerge(pendingMergeUris, destUri)
+            startMerge(pendingMergeUris, destUri, pendingMode)
         }
         pendingMergeUris = emptyList()
+        pendingMode = MergeEngine.Mode.FAST
     }
 
     private val connection = object : ServiceConnection {
@@ -369,7 +377,9 @@ class MainActivity : ComponentActivity() {
                     AppScreen(
                         vm = vm,
                         onStartSaveAs = { uris -> beginSaveAs(uris) },
-                        onCancelMerge = { cancelMerge() }
+                        onCancelMerge = { cancelMerge() },
+                        onConfirmReencode = { proceedWithCompatibleMode() },
+                        onCancelMismatch = { cancelMismatchDialog() }
                     )
                 }
             }
@@ -387,17 +397,69 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun beginSaveAs(uris: List<Uri>) {
+        // Analyze clips first. If they're uniform, go straight to save-as in Fast mode.
+        // If they differ, ask the user via the ViewModel's mismatch dialog.
+        vm.status = "Analyzing clips..."
+        vm.isProcessing = false
+        lifecycleScope.launch {
+            val names = uris.map { uri ->
+                vm.clips.firstOrNull { it.uri == uri }?.name ?: "clip"
+            }
+            val analysis = withContext(Dispatchers.IO) {
+                ClipAnalyzer.analyze(this@MainActivity, uris, names)
+            }
+            when (analysis) {
+                is ClipAnalyzer.AnalysisResult.Uniform -> {
+                    vm.status = "Clips are uniform. Ready to fast-merge."
+                    pendingMode = MergeEngine.Mode.FAST
+                    launchSaveAsDialog(uris)
+                }
+                is ClipAnalyzer.AnalysisResult.Mixed -> {
+                    vm.status = "${analysis.mismatches.size} of ${uris.size} clips differ — re-encoding needed."
+                    vm.pendingMismatches = analysis.mismatches
+                    vm.pendingMergeUrisForDialog = uris
+                    vm.showMismatchDialog = true
+                }
+                is ClipAnalyzer.AnalysisResult.Failed -> {
+                    Toast.makeText(this@MainActivity,
+                        "Could not analyze clips: ${analysis.message}", Toast.LENGTH_LONG).show()
+                    vm.status = "Analysis failed: ${analysis.message}"
+                }
+            }
+        }
+    }
+
+    /** Called when the user accepts re-encoding from the mismatch dialog. */
+    fun proceedWithCompatibleMode() {
+        val uris = vm.pendingMergeUrisForDialog
+        vm.showMismatchDialog = false
+        vm.pendingMismatches = emptyList()
+        vm.pendingMergeUrisForDialog = emptyList()
+        if (uris.isEmpty()) return
+        pendingMode = MergeEngine.Mode.COMPATIBLE
+        launchSaveAsDialog(uris)
+    }
+
+    /** Called when the user cancels the mismatch dialog. */
+    fun cancelMismatchDialog() {
+        vm.showMismatchDialog = false
+        vm.pendingMismatches = emptyList()
+        vm.pendingMergeUrisForDialog = emptyList()
+        vm.status = "Merge cancelled."
+    }
+
+    private fun launchSaveAsDialog(uris: List<Uri>) {
         pendingMergeUris = uris
         val defaultName = "vlog_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".mp4"
         saveAsLauncher.launch(defaultName)
     }
 
-    private fun startMerge(uris: List<Uri>, outputUri: Uri) {
+    private fun startMerge(uris: List<Uri>, outputUri: Uri, mode: MergeEngine.Mode) {
         vm.isProcessing = true
         vm.progress = 0f
-        vm.status = "Starting..."
+        vm.status = "Starting (${if (mode == MergeEngine.Mode.FAST) "Fast" else "Compatible"} mode)..."
         vm.lastMergedOutputUri = outputUri
-        MergeService.start(this, uris, outputUri)
+        MergeService.start(this, uris, outputUri, mode)
         bindService(Intent(this, MergeService::class.java), connection, Context.BIND_AUTO_CREATE)
     }
 
@@ -412,7 +474,9 @@ class MainActivity : ComponentActivity() {
 fun AppScreen(
     vm: MainViewModel,
     onStartSaveAs: (List<Uri>) -> Unit,
-    onCancelMerge: () -> Unit
+    onCancelMerge: () -> Unit,
+    onConfirmReencode: () -> Unit,
+    onCancelMismatch: () -> Unit
 ) {
     val context = LocalContext.current
     val folderPicker = rememberLauncherForActivityResult(
@@ -752,6 +816,67 @@ fun AppScreen(
             dismissButton = {
                 TextButton(onClick = { vm.includeExcludedFiles() }) {
                     Text("Include anyway")
+                }
+            }
+        )
+    }
+
+    if (vm.showMismatchDialog && vm.pendingMismatches.isNotEmpty()) {
+        AlertDialog(
+            onDismissRequest = { onCancelMismatch() },
+            icon = { Icon(Icons.Filled.Warning, null, tint = MaterialTheme.colorScheme.tertiary) },
+            title = { Text("Clips don't match") },
+            text = {
+                Column {
+                    Text(
+                        "${vm.pendingMismatches.size} clip(s) differ from the first clip's format. " +
+                        "These need to be re-encoded to merge.",
+                        fontSize = 13.sp
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    LazyColumn(
+                        modifier = Modifier
+                            .heightIn(max = 240.dp)
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
+                            .padding(8.dp)
+                    ) {
+                        items(vm.pendingMismatches) { mismatch ->
+                            Column(modifier = Modifier.padding(vertical = 4.dp)) {
+                                Text(
+                                    mismatch.clipName,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    maxLines = 1
+                                )
+                                mismatch.differences.forEach { diff ->
+                                    Text(
+                                        "  • $diff",
+                                        fontSize = 10.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "Re-encoding takes longer and slightly reduces quality. " +
+                        "Stream copy (fast mode) isn't possible for these clips.",
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { onConfirmReencode() }) {
+                    Text("Re-encode and merge")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { onCancelMismatch() }) {
+                    Text("Cancel")
                 }
             }
         )
