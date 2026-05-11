@@ -26,6 +26,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.ContentCut
@@ -59,6 +60,10 @@ import java.util.Date
 import java.util.Locale
 
 class MainViewModel(app: Application) : AndroidViewModel(app) {
+    // Hub-and-spoke navigation state
+    enum class Screen { HUB, MERGE, EDIT, AUDIO }
+    var currentScreen by mutableStateOf(Screen.HUB)
+
     var folderUri by mutableStateOf<Uri?>(null); private set
     var folderName by mutableStateOf<String?>(null); private set
     var clips by mutableStateOf<List<VideoClip>>(emptyList()); private set
@@ -346,6 +351,22 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** Convenience overload — for callers who don't need a completion callback. */
+    fun deleteClips(uris: List<Uri>) {
+        deleteClips(uris) { }
+    }
+
+    /** Rescan the current folder. No-op if no folder is set. */
+    fun refreshFolder() {
+        folderUri?.let { setFolder(it, savePref = false) }
+    }
+
+    /** Dismiss the post-merge "delete sources?" prompt. */
+    fun dismissDeletePrompt() {
+        showDeletePromptAfterMerge = false
+        postMergeSourceUris = emptyList()
+    }
+
     fun totalSelectedDuration(): Long = clips
         .filter { selectionOrder.contains(it.uri) }
         .sumOf { it.durationSec }
@@ -385,7 +406,7 @@ class MainActivity : ComponentActivity() {
                             "Saved! ${"%.1f".format(result.outputBytes / 1024.0 / 1024.0)} MB",
                             Toast.LENGTH_LONG).show()
                         // Refresh folder in case the merged file was saved into it
-                        vm.refresh()
+                        vm.refreshFolder()
                         val srcUris = mergeService?.lastSourceUris ?: emptyList()
                         if (srcUris.isNotEmpty()) {
                             vm.postMergeSourceUris = srcUris
@@ -414,7 +435,7 @@ class MainActivity : ComponentActivity() {
             }
         }
         setContent {
-            MaterialTheme(colorScheme = darkColorScheme()) {
+            com.camcompiler.app.ui.theme.CamCompilerTheme {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
                     AppScreen(
                         vm = vm,
@@ -536,7 +557,6 @@ class MainActivity : ComponentActivity() {
         startService(intent)
     }
 }
-
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun AppScreen(
@@ -560,7 +580,6 @@ fun AppScreen(
         }
     }
 
-    // Music picker — choose audio file to mix into the merge
     val musicPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
@@ -575,6 +594,401 @@ fun AppScreen(
         }
     }
 
+    Column(modifier = Modifier.fillMaxSize()) {
+        // Top app bar — shows screen title + back button on task screens
+        TopBar(
+            screen = vm.currentScreen,
+            folderName = vm.folderName,
+            onBack = { vm.currentScreen = MainViewModel.Screen.HUB }
+        )
+
+        // Screen content — dispatched by currentScreen
+        when (vm.currentScreen) {
+            MainViewModel.Screen.HUB -> HubScreen(
+                vm = vm,
+                onPickFolder = { folderPicker.launch(null) },
+                onSelectTask = { task -> vm.currentScreen = task }
+            )
+            MainViewModel.Screen.MERGE -> MergeScreen(
+                vm = vm,
+                musicPicker = musicPicker,
+                onStartSaveAs = onStartSaveAs,
+                onCancelMerge = onCancelMerge
+            )
+            MainViewModel.Screen.EDIT -> EditScreen(vm = vm)
+            MainViewModel.Screen.AUDIO -> AudioScreen(
+                vm = vm,
+                musicPicker = musicPicker,
+                onStartSaveAs = onStartSaveAs,
+                onCancelMerge = onCancelMerge
+            )
+        }
+    }
+
+    // ============================ Dialogs (global) ============================
+
+    if (vm.showExclusionPrompt && vm.pendingExclusions.isNotEmpty()) {
+        AlertDialog(
+            onDismissRequest = { vm.ignoreExcludedFiles() },
+            icon = { Icon(Icons.Filled.Warning, null, tint = MaterialTheme.colorScheme.tertiary) },
+            title = { Text("${vm.pendingExclusions.size} file(s) need review") },
+            text = {
+                Column {
+                    Text(
+                        "These files have video extensions but couldn't be validated. What would you like to do?",
+                        fontSize = 13.sp
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    LazyColumn(
+                        modifier = Modifier
+                            .heightIn(max = 220.dp)
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
+                            .padding(8.dp)
+                    ) {
+                        items(vm.pendingExclusions) { ex ->
+                            Column(modifier = Modifier.padding(vertical = 4.dp)) {
+                                Text(ex.name, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+                                Text("${"%.1f".format(ex.sizeMb)} MB  •  ${ex.reason}",
+                                    fontSize = 10.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = { TextButton(onClick = { vm.ignoreExcludedFiles() }) { Text("Ignore these") } },
+            dismissButton = { TextButton(onClick = { vm.includeExcludedFiles() }) { Text("Include anyway") } }
+        )
+    }
+
+    if (vm.showMismatchDialog && vm.pendingMismatches.isNotEmpty()) {
+        AlertDialog(
+            onDismissRequest = { onCancelMismatch() },
+            icon = { Icon(Icons.Filled.Warning, null, tint = MaterialTheme.colorScheme.tertiary) },
+            title = { Text("Re-encoding required") },
+            text = {
+                Column {
+                    Text(
+                        "${vm.pendingMismatches.size} item(s) require re-encoding for this merge.",
+                        fontSize = 13.sp
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    LazyColumn(
+                        modifier = Modifier
+                            .heightIn(max = 240.dp)
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
+                            .padding(8.dp)
+                    ) {
+                        items(vm.pendingMismatches) { m ->
+                            Column(modifier = Modifier.padding(vertical = 4.dp)) {
+                                Text(m.clipName, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+                                m.differences.forEach { diff ->
+                                    Text("  • $diff", fontSize = 10.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                }
+                            }
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Text("Re-encoding takes longer and slightly reduces quality.",
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            },
+            confirmButton = { TextButton(onClick = { onConfirmReencode() }) { Text("Re-encode and merge") } },
+            dismissButton = { TextButton(onClick = { onCancelMismatch() }) { Text("Cancel") } }
+        )
+    }
+
+    // Trim editor — opens for whichever clip is being trimmed
+    val trimmingUri = vm.trimmingClipUri
+    if (trimmingUri != null) {
+        val clipToTrim = vm.clips.firstOrNull { it.uri == trimmingUri }
+        if (clipToTrim != null) {
+            TrimEditorDialog(
+                clip = clipToTrim,
+                initialEdit = vm.getEditForClip(trimmingUri),
+                onSave = { newEdit ->
+                    if (newEdit.hasEdits()) vm.setClipEdit(trimmingUri, newEdit)
+                    else vm.clearClipEdit(trimmingUri)
+                    vm.trimmingClipUri = null
+                },
+                onCancel = { vm.trimmingClipUri = null }
+            )
+        } else {
+            vm.trimmingClipUri = null
+        }
+    }
+}
+
+// ============================ Top bar ============================
+
+@Composable
+private fun TopBar(
+    screen: MainViewModel.Screen,
+    folderName: String?,
+    onBack: () -> Unit
+) {
+    val title = when (screen) {
+        MainViewModel.Screen.HUB -> "Cam Compiler"
+        MainViewModel.Screen.MERGE -> "Merge Clips"
+        MainViewModel.Screen.EDIT -> "Edit Clip"
+        MainViewModel.Screen.AUDIO -> "Replace Audio"
+    }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(MaterialTheme.colorScheme.surface)
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        if (screen != MainViewModel.Screen.HUB) {
+            IconButton(onClick = onBack, modifier = Modifier.size(36.dp)) {
+                Icon(Icons.Filled.ArrowBack, "Back",
+                    tint = MaterialTheme.colorScheme.onSurface)
+            }
+            Spacer(Modifier.width(4.dp))
+        }
+        Column(modifier = Modifier.weight(1f)) {
+            Text(title,
+                fontSize = 18.sp,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.onSurface)
+            if (screen != MainViewModel.Screen.HUB && folderName != null) {
+                Text(folderName,
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+                    maxLines = 1)
+            }
+        }
+    }
+}
+
+// ============================ Hub screen ============================
+
+@Composable
+private fun HubScreen(
+    vm: MainViewModel,
+    onPickFolder: () -> Unit,
+    onSelectTask: (MainViewModel.Screen) -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(16.dp)
+    ) {
+        // Folder selection card
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(onClick = onPickFolder),
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surface
+            )
+        ) {
+            Row(
+                modifier = Modifier.padding(16.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    Icons.Filled.Folder,
+                    null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(32.dp)
+                )
+                Spacer(Modifier.width(12.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        if (vm.folderName != null) "Working folder" else "Pick a folder",
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
+                    )
+                    Text(
+                        vm.folderName ?: "Tap to select a folder",
+                        fontSize = 15.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        maxLines = 1
+                    )
+                    if (vm.clips.isNotEmpty()) {
+                        Text(
+                            "${vm.clips.size} clip(s)  •  ${formatDuration(vm.totalAllDuration())}  •  ${"%.0f".format(vm.totalAllSizeMb())} MB",
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                }
+                if (vm.folderName != null) {
+                    TextButton(onClick = onPickFolder) { Text("Change") }
+                }
+            }
+        }
+
+        Spacer(Modifier.height(24.dp))
+
+        Text(
+            "What would you like to do?",
+            fontSize = 16.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.onBackground
+        )
+
+        Spacer(Modifier.height(12.dp))
+
+        // 3-column grid of task tiles
+        val hasFolder = vm.folderUri != null && vm.clips.isNotEmpty()
+
+        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                TaskTile(
+                    icon = Icons.Filled.AutoAwesome,
+                    label = "Merge",
+                    sublabel = "Combine clips",
+                    enabled = hasFolder,
+                    modifier = Modifier.weight(1f),
+                    onClick = { onSelectTask(MainViewModel.Screen.MERGE) }
+                )
+                TaskTile(
+                    icon = Icons.Filled.ContentCut,
+                    label = "Edit",
+                    sublabel = "Trim a clip",
+                    enabled = hasFolder,
+                    modifier = Modifier.weight(1f),
+                    onClick = { onSelectTask(MainViewModel.Screen.EDIT) }
+                )
+                TaskTile(
+                    icon = Icons.Filled.MusicNote,
+                    label = "Audio",
+                    sublabel = "Replace sound",
+                    enabled = hasFolder,
+                    modifier = Modifier.weight(1f),
+                    onClick = { onSelectTask(MainViewModel.Screen.AUDIO) }
+                )
+            }
+            // Empty placeholder row for future features
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                TaskTile(
+                    icon = Icons.Filled.Tune,
+                    label = "Filters",
+                    sublabel = "Coming soon",
+                    enabled = false,
+                    modifier = Modifier.weight(1f),
+                    onClick = { }
+                )
+                TaskTile(
+                    icon = Icons.Filled.AutoAwesome,
+                    label = "Highlights",
+                    sublabel = "Coming soon",
+                    enabled = false,
+                    modifier = Modifier.weight(1f),
+                    onClick = { }
+                )
+                TaskTile(
+                    icon = Icons.Filled.PlayCircle,
+                    label = "Beat sync",
+                    sublabel = "Coming soon",
+                    enabled = false,
+                    modifier = Modifier.weight(1f),
+                    onClick = { }
+                )
+            }
+        }
+
+        if (!hasFolder) {
+            Spacer(Modifier.height(20.dp))
+            Text(
+                if (vm.folderUri == null) "Pick a folder above to enable tasks."
+                else "No clips found in this folder.",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.5f),
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                modifier = Modifier.fillMaxWidth()
+            )
+        }
+
+        // Optional status text
+        if (vm.status.isNotBlank() && vm.folderUri == null) {
+            Spacer(Modifier.height(16.dp))
+            Text(vm.status, fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f),
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                modifier = Modifier.fillMaxWidth())
+        }
+    }
+}
+
+@Composable
+private fun TaskTile(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    sublabel: String,
+    enabled: Boolean,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit
+) {
+    val containerColor = if (enabled)
+        MaterialTheme.colorScheme.surface
+    else
+        MaterialTheme.colorScheme.surface.copy(alpha = 0.4f)
+    val contentColor = if (enabled)
+        MaterialTheme.colorScheme.onSurface
+    else
+        MaterialTheme.colorScheme.onSurface.copy(alpha = 0.4f)
+    val iconTint = if (enabled)
+        MaterialTheme.colorScheme.primary
+    else
+        MaterialTheme.colorScheme.primary.copy(alpha = 0.3f)
+
+    Card(
+        modifier = modifier
+            .aspectRatio(1f)
+            .clickable(enabled = enabled, onClick = onClick),
+        colors = CardDefaults.cardColors(containerColor = containerColor)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(10.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Icon(icon, null, tint = iconTint, modifier = Modifier.size(36.dp))
+            Spacer(Modifier.height(6.dp))
+            Text(label,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = contentColor,
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+            Text(sublabel,
+                fontSize = 10.sp,
+                color = contentColor.copy(alpha = 0.6f),
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                maxLines = 1)
+        }
+    }
+}
+
+// ============================ Merge screen ============================
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun MergeScreen(
+    vm: MainViewModel,
+    musicPicker: androidx.activity.compose.ManagedActivityResultLauncher<Array<String>, Uri?>,
+    onStartSaveAs: (List<Uri>) -> Unit,
+    onCancelMerge: () -> Unit
+) {
+    val context = LocalContext.current
     var showDeleteConfirm by remember { mutableStateOf(false) }
     var pendingDeleteUris by remember { mutableStateOf<List<Uri>>(emptyList()) }
 
@@ -583,240 +997,114 @@ fun AppScreen(
             .fillMaxSize()
             .padding(horizontal = 16.dp, vertical = 12.dp)
     ) {
+        // Header: clip count + manage toggle + refresh
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    "Cam Compiler",
-                    fontSize = 24.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.primary
-                )
-                vm.folderName?.let {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Filled.Folder, null, modifier = Modifier.size(14.dp),
-                            tint = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f))
-                        Spacer(Modifier.width(4.dp))
-                        Text(it, fontSize = 12.sp, color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.7f))
-                    }
-                }
+            Text(
+                "${vm.clips.size} clip(s)  •  ${formatDuration(vm.totalAllDuration())}  •  ${"%.0f".format(vm.totalAllSizeMb())} MB",
+                fontSize = 13.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onBackground,
+                modifier = Modifier.weight(1f)
+            )
+            IconButton(onClick = { vm.refreshFolder() }) {
+                Icon(Icons.Filled.Refresh, "Rescan folder")
             }
-            if (vm.folderUri != null) {
-                IconButton(
-                    onClick = { vm.refresh() },
-                    enabled = !vm.isProcessing,
-                    modifier = Modifier.size(36.dp)
-                ) {
-                    Icon(Icons.Filled.Refresh, "Refresh folder",
-                        modifier = Modifier.size(18.dp))
-                }
-            }
-            if (vm.clips.isNotEmpty()) {
-                FilterChip(
-                    selected = vm.manageMode,
-                    onClick = { vm.toggleManageMode() },
-                    label = { Text(if (vm.manageMode) "Done" else "Manage", fontSize = 12.sp) },
-                    leadingIcon = if (vm.manageMode) null else {
-                        { Icon(Icons.Filled.Tune, null, modifier = Modifier.size(14.dp)) }
-                    },
-                    enabled = !vm.isProcessing
-                )
-            }
+            FilterChip(
+                selected = vm.manageMode,
+                onClick = {
+                    vm.manageMode = !vm.manageMode
+                    if (!vm.manageMode) vm.clearSelection()
+                },
+                label = { Text(if (vm.manageMode) "Done" else "Manage", fontSize = 12.sp) },
+                modifier = Modifier.padding(start = 4.dp)
+            )
         }
 
-        Spacer(Modifier.height(6.dp))
-        Text(vm.status, fontSize = 12.sp,
-            color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f))
+        // Sort info
+        vm.lastSortInfo?.let { si ->
+            Spacer(Modifier.height(4.dp))
+            val note = when {
+                si.fellBackToMtime > 0 -> "Sorted chronologically  •  ${si.fellBackToMtime} fallback to file time"
+                else -> "Sorted chronologically by filename timestamp"
+            }
+            Text(note, fontSize = 11.sp,
+                color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f))
+        }
 
-        vm.lastSortInfo?.warning?.let { warning ->
-            Spacer(Modifier.height(8.dp))
+        // Status / warnings
+        if (vm.status.isNotBlank() && vm.clips.isNotEmpty()) {
+            Spacer(Modifier.height(6.dp))
+            Text(vm.status, fontSize = 11.sp,
+                color = if (vm.isProcessing) MaterialTheme.colorScheme.primary
+                    else MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f))
+        }
+
+        Spacer(Modifier.height(8.dp))
+
+        // Selection/action bar (when items are selected in non-manage mode)
+        if (!vm.manageMode && vm.selectionOrder.isNotEmpty() && !vm.isProcessing) {
             Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(6.dp))
-                    .background(MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.4f))
-                    .padding(8.dp),
+                modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Icon(Icons.Filled.Warning, null, tint = MaterialTheme.colorScheme.error,
-                    modifier = Modifier.size(16.dp))
+                Text(
+                    "Merge ${vm.selectionOrder.size} selected  •  ${formatDuration(vm.totalSelectedDuration())}  •  ${"%.0f".format(vm.totalSelectedSizeMb())} MB",
+                    fontSize = 12.sp,
+                    modifier = Modifier.weight(1f)
+                )
+                OutlinedButton(onClick = { vm.clearSelection() }) { Text("Clear") }
+            }
+            Spacer(Modifier.height(8.dp))
+            Button(
+                onClick = { onStartSaveAs(vm.selectionOrder) },
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.secondary,
+                    contentColor = MaterialTheme.colorScheme.onSecondary
+                )
+            ) {
+                Icon(Icons.Filled.AutoAwesome, null, modifier = Modifier.size(18.dp))
                 Spacer(Modifier.width(8.dp))
-                Text(warning, fontSize = 11.sp, color = MaterialTheme.colorScheme.onErrorContainer)
+                Text("Merge selected clips")
             }
         }
 
-        Spacer(Modifier.height(12.dp))
-
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedButton(
-                onClick = { folderPicker.launch(null) },
-                modifier = Modifier.weight(1f),
-                enabled = !vm.isProcessing
-            ) { Text(if (vm.folderUri == null) "Pick Folder" else "Change Folder") }
-
-            if (vm.manageMode && vm.selectionOrder.isNotEmpty()) {
+        // Manage-mode delete bar
+        if (vm.manageMode && vm.selectionOrder.isNotEmpty() && !vm.isProcessing) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    "${vm.selectionOrder.size} selected for deletion",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.weight(1f)
+                )
+                OutlinedButton(onClick = { vm.clearSelection() }) { Text("Clear") }
+                Spacer(Modifier.width(8.dp))
                 Button(
                     onClick = {
-                        pendingDeleteUris = vm.selectionOrder
+                        pendingDeleteUris = vm.selectionOrder.toList()
                         showDeleteConfirm = true
                     },
-                    enabled = !vm.isProcessing,
                     colors = ButtonDefaults.buttonColors(
                         containerColor = MaterialTheme.colorScheme.error
                     )
                 ) {
                     Icon(Icons.Filled.Delete, null, modifier = Modifier.size(16.dp))
                     Spacer(Modifier.width(4.dp))
-                    Text("Delete (${vm.selectionOrder.size})")
-                }
-            } else if (vm.selectionOrder.isNotEmpty() && !vm.manageMode) {
-                OutlinedButton(
-                    onClick = { vm.clearSelection() },
-                    enabled = !vm.isProcessing
-                ) { Text("Clear") }
-            }
-        }
-
-        if (!vm.manageMode && vm.clips.isNotEmpty() && !vm.isProcessing) {
-            Spacer(Modifier.height(8.dp))
-            FilledTonalButton(
-                onClick = { onStartSaveAs(vm.clips.map { it.uri }) },
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Icon(Icons.Filled.AutoAwesome, null, modifier = Modifier.size(18.dp))
-                Spacer(Modifier.width(8.dp))
-                Text("Merge ALL ${vm.clips.size} clips  •  ${formatDuration(vm.totalAllDuration())}  •  ${"%.0f".format(vm.totalAllSizeMb())} MB")
-            }
-
-            // Music picker row
-            Spacer(Modifier.height(6.dp))
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(6.dp))
-                    .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
-                    .clickable { musicPicker.launch(arrayOf("audio/*")) }
-                    .padding(horizontal = 10.dp, vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Icon(
-                    Icons.Filled.MusicNote,
-                    null,
-                    modifier = Modifier.size(16.dp),
-                    tint = if (vm.musicUri != null) MaterialTheme.colorScheme.primary
-                        else MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                Spacer(Modifier.width(8.dp))
-                Column(modifier = Modifier.weight(1f)) {
-                    if (vm.musicUri != null) {
-                        Text(
-                            "Music: ${vm.musicName ?: "audio"}",
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            color = MaterialTheme.colorScheme.primary,
-                            maxLines = 1
-                        )
-                        Text(
-                            "Tap to change  •  will force re-encoding",
-                            fontSize = 10.sp,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    } else {
-                        Text(
-                            "Add background music",
-                            fontSize = 12.sp,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                }
-                if (vm.musicUri != null) {
-                    TextButton(
-                        onClick = { vm.setMusic(null, null) },
-                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
-                    ) {
-                        Text("Remove", fontSize = 11.sp)
-                    }
+                    Text("Delete")
                 }
             }
         }
 
-        if (vm.isProcessing) {
-            Spacer(Modifier.height(12.dp))
-            LinearProgressIndicator(
-                progress = { vm.progress.coerceIn(0f, 1f) },
-                modifier = Modifier.fillMaxWidth()
-            )
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text("${(vm.progress * 100).toInt()}%", fontSize = 12.sp)
-                TextButton(onClick = onCancelMerge) { Text("Cancel") }
-            }
-        }
+        Spacer(Modifier.height(8.dp))
 
-        // Show a "play last merged" banner if there's a recent output and not currently processing
-        if (!vm.isProcessing && vm.lastMergedOutputUri != null) {
-            Spacer(Modifier.height(8.dp))
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.4f))
-                    .clickable { vm.lastMergedOutputUri?.let { playVideo(context, it) } }
-                    .padding(horizontal = 10.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Icon(
-                    Icons.Filled.PlayCircle, null,
-                    tint = MaterialTheme.colorScheme.primary,
-                    modifier = Modifier.size(20.dp)
-                )
-                Spacer(Modifier.width(8.dp))
-                Text(
-                    "Tap to play the merged video",
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    modifier = Modifier.weight(1f),
-                    color = MaterialTheme.colorScheme.onPrimaryContainer
-                )
-                TextButton(
-                    onClick = { vm.lastMergedOutputUri = null },
-                    contentPadding = PaddingValues(8.dp, 0.dp)
-                ) {
-                    Text("Dismiss", fontSize = 11.sp)
-                }
-            }
-        }
-
-        Spacer(Modifier.height(12.dp))
-
-        if (vm.manageMode && !vm.isProcessing) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(6.dp))
-                    .background(MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.5f))
-                    .padding(horizontal = 10.dp, vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Icon(Icons.Filled.Tune, null, modifier = Modifier.size(14.dp),
-                    tint = MaterialTheme.colorScheme.onTertiaryContainer)
-                Spacer(Modifier.width(6.dp))
-                Text("Manage: tap to mark for deletion",
-                    fontSize = 11.sp,
-                    color = MaterialTheme.colorScheme.onTertiaryContainer,
-                    modifier = Modifier.weight(1f))
-                TextButton(onClick = { vm.selectAllInOrder() }, contentPadding = PaddingValues(8.dp, 0.dp)) {
-                    Text("Select all", fontSize = 11.sp)
-                }
-            }
-            Spacer(Modifier.height(6.dp))
-        }
-
+        // Clip list
         LazyColumn(
             modifier = Modifier.weight(1f),
             verticalArrangement = Arrangement.spacedBy(6.dp)
@@ -834,33 +1122,62 @@ fun AppScreen(
             }
         }
 
-        if (!vm.manageMode && vm.selectionOrder.isNotEmpty() && !vm.isProcessing) {
+        // Merge-all button when no selection
+        if (!vm.manageMode && vm.selectionOrder.isEmpty() && vm.clips.isNotEmpty() && !vm.isProcessing) {
             Spacer(Modifier.height(8.dp))
             Button(
-                onClick = { onStartSaveAs(vm.selectionOrder) },
-                modifier = Modifier.fillMaxWidth()
+                onClick = { onStartSaveAs(vm.clips.map { it.uri }) },
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.secondary,
+                    contentColor = MaterialTheme.colorScheme.onSecondary
+                )
             ) {
-                Text("Merge ${vm.selectionOrder.size} selected  •  ${formatDuration(vm.totalSelectedDuration())}  •  ${"%.0f".format(vm.totalSelectedSizeMb())} MB")
+                Icon(Icons.Filled.AutoAwesome, null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("Merge ALL ${vm.clips.size} clips")
+            }
+
+            // Music chip
+            Spacer(Modifier.height(6.dp))
+            MusicChip(vm = vm, musicPicker = musicPicker)
+        }
+
+        // Progress
+        if (vm.isProcessing) {
+            Spacer(Modifier.height(12.dp))
+            LinearProgressIndicator(
+                progress = { vm.progress.coerceIn(0f, 1f) },
+                modifier = Modifier.fillMaxWidth(),
+                color = MaterialTheme.colorScheme.primary
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("${(vm.progress * 100).toInt()}%", fontSize = 12.sp)
+                TextButton(onClick = onCancelMerge) { Text("Cancel") }
             }
         }
     }
 
-    if (showDeleteConfirm) {
+    // Delete confirmation
+    if (showDeleteConfirm && pendingDeleteUris.isNotEmpty()) {
         AlertDialog(
             onDismissRequest = { showDeleteConfirm = false },
-            icon = { Icon(Icons.Filled.Delete, null, tint = MaterialTheme.colorScheme.error) },
-            title = { Text("Delete ${pendingDeleteUris.size} clips?") },
-            text = { Text("This will permanently delete the selected clips from the folder. This cannot be undone.") },
+            icon = { Icon(Icons.Filled.Warning, null, tint = MaterialTheme.colorScheme.error) },
+            title = { Text("Delete ${pendingDeleteUris.size} clip(s)?") },
+            text = { Text("This permanently removes the files. This cannot be undone.") },
             confirmButton = {
-                TextButton(
-                    onClick = {
-                        val toDelete = pendingDeleteUris
-                        showDeleteConfirm = false
-                        vm.deleteClips(toDelete) {
-                            Toast.makeText(context, "Deleted", Toast.LENGTH_SHORT).show()
-                        }
-                    }
-                ) { Text("Delete", color = MaterialTheme.colorScheme.error) }
+                TextButton(onClick = {
+                    val urisToDel = pendingDeleteUris
+                    showDeleteConfirm = false
+                    pendingDeleteUris = emptyList()
+                    vm.deleteClips(urisToDel)
+                }) {
+                    Text("Delete", color = MaterialTheme.colorScheme.error)
+                }
             },
             dismissButton = {
                 TextButton(onClick = { showDeleteConfirm = false }) { Text("Cancel") }
@@ -868,174 +1185,193 @@ fun AppScreen(
         )
     }
 
-    if (vm.showDeletePromptAfterMerge) {
+    // Post-merge prompt to delete source clips
+    if (vm.showDeletePromptAfterMerge && vm.postMergeSourceUris.isNotEmpty()) {
         AlertDialog(
-            onDismissRequest = {
-                vm.showDeletePromptAfterMerge = false
-                vm.postMergeSourceUris = emptyList()
-            },
-            icon = { Icon(Icons.Filled.Delete, null) },
-            title = { Text("Delete source clips?") },
+            onDismissRequest = { vm.dismissDeletePrompt() },
+            icon = { Icon(Icons.Filled.CheckCircle, null, tint = MaterialTheme.colorScheme.primary) },
+            title = { Text("Merge complete") },
             text = {
-                Text("The merged video has been saved. Delete the ${vm.postMergeSourceUris.size} source clips from the folder?")
+                Text("Delete the ${vm.postMergeSourceUris.size} source clip(s) used for this merge? " +
+                     "The merged output is preserved.")
             },
             confirmButton = {
-                TextButton(
-                    onClick = {
-                        val toDelete = vm.postMergeSourceUris
-                        vm.showDeletePromptAfterMerge = false
-                        vm.postMergeSourceUris = emptyList()
-                        vm.deleteClips(toDelete) {
-                            Toast.makeText(context, "Source clips deleted", Toast.LENGTH_SHORT).show()
-                        }
-                    }
-                ) { Text("Delete sources", color = MaterialTheme.colorScheme.error) }
-            },
-            dismissButton = {
                 TextButton(onClick = {
-                    vm.showDeletePromptAfterMerge = false
-                    vm.postMergeSourceUris = emptyList()
-                }) { Text("Keep them") }
-            }
-        )
-    }
-
-    if (vm.showExclusionPrompt && vm.pendingExclusions.isNotEmpty()) {
-        AlertDialog(
-            onDismissRequest = { vm.ignoreExcludedFiles() },
-            icon = { Icon(Icons.Filled.Warning, null, tint = MaterialTheme.colorScheme.tertiary) },
-            title = { Text("${vm.pendingExclusions.size} file(s) need review") },
-            text = {
-                Column {
-                    Text(
-                        "These files have video extensions but couldn't be validated (no readable video track). What would you like to do?",
-                        fontSize = 13.sp
-                    )
-                    Spacer(Modifier.height(8.dp))
-                    LazyColumn(
-                        modifier = Modifier
-                            .heightIn(max = 220.dp)
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(6.dp))
-                            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
-                            .padding(8.dp)
-                    ) {
-                        items(vm.pendingExclusions) { ex ->
-                            Column(modifier = Modifier.padding(vertical = 4.dp)) {
-                                Text(
-                                    ex.name,
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.SemiBold,
-                                    maxLines = 1
-                                )
-                                Text(
-                                    "${"%.1f".format(ex.sizeMb)} MB  •  ${ex.reason}",
-                                    fontSize = 10.sp,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
-                        }
-                    }
-                    Spacer(Modifier.height(8.dp))
-                    Text(
-                        "Including unverified files may cause the merge to fail when it reaches them.",
-                        fontSize = 11.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-            },
-            confirmButton = {
-                TextButton(onClick = { vm.ignoreExcludedFiles() }) {
-                    Text("Ignore these")
+                    val toDel = vm.postMergeSourceUris.toList()
+                    vm.dismissDeletePrompt()
+                    vm.deleteClips(toDel)
+                }) {
+                    Text("Delete sources", color = MaterialTheme.colorScheme.error)
                 }
             },
             dismissButton = {
-                TextButton(onClick = { vm.includeExcludedFiles() }) {
-                    Text("Include anyway")
-                }
+                TextButton(onClick = { vm.dismissDeletePrompt() }) { Text("Keep") }
             }
         )
     }
+}
 
-    if (vm.showMismatchDialog && vm.pendingMismatches.isNotEmpty()) {
-        AlertDialog(
-            onDismissRequest = { onCancelMismatch() },
-            icon = { Icon(Icons.Filled.Warning, null, tint = MaterialTheme.colorScheme.tertiary) },
-            title = { Text("Clips don't match") },
-            text = {
-                Column {
-                    Text(
-                        "${vm.pendingMismatches.size} clip(s) differ from the first clip's format. " +
-                        "These need to be re-encoded to merge.",
-                        fontSize = 13.sp
-                    )
-                    Spacer(Modifier.height(8.dp))
-                    LazyColumn(
-                        modifier = Modifier
-                            .heightIn(max = 240.dp)
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(6.dp))
-                            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
-                            .padding(8.dp)
-                    ) {
-                        items(vm.pendingMismatches) { mismatch ->
-                            Column(modifier = Modifier.padding(vertical = 4.dp)) {
-                                Text(
-                                    mismatch.clipName,
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.SemiBold,
-                                    maxLines = 1
-                                )
-                                mismatch.differences.forEach { diff ->
-                                    Text(
-                                        "  • $diff",
-                                        fontSize = 10.sp,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                }
-                            }
-                        }
-                    }
-                    Spacer(Modifier.height(8.dp))
-                    Text(
-                        "Re-encoding takes longer and slightly reduces quality. " +
-                        "Stream copy (fast mode) isn't possible for these clips.",
-                        fontSize = 11.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-            },
-            confirmButton = {
-                TextButton(onClick = { onConfirmReencode() }) {
-                    Text("Re-encode and merge")
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { onCancelMismatch() }) {
-                    Text("Cancel")
-                }
-            }
+// ============================ Edit screen ============================
+
+@Composable
+private fun EditScreen(vm: MainViewModel) {
+    val context = LocalContext.current
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 16.dp, vertical = 12.dp)
+    ) {
+        Text(
+            "Pick a clip to edit (trim, multi-range cuts)",
+            fontSize = 13.sp,
+            color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.7f)
         )
-    }
 
-    // Trim editor — opens when a clip's trim button is tapped
-    val trimmingUri = vm.trimmingClipUri
-    if (trimmingUri != null) {
-        val clipToTrim = vm.clips.firstOrNull { it.uri == trimmingUri }
-        if (clipToTrim != null) {
-            TrimEditorDialog(
-                clip = clipToTrim,
-                initialEdit = vm.getEditForClip(trimmingUri),
-                onSave = { newEdit ->
-                    if (newEdit.hasEdits()) vm.setClipEdit(trimmingUri, newEdit)
-                    else vm.clearClipEdit(trimmingUri)
-                    vm.trimmingClipUri = null
-                },
-                onCancel = { vm.trimmingClipUri = null }
+        Spacer(Modifier.height(12.dp))
+
+        LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            items(vm.clips) { clip ->
+                ClipRow(
+                    clip = clip,
+                    clipEdit = vm.getEditForClip(clip.uri),
+                    selectionIndex = null,
+                    manageMode = false,
+                    onClick = { vm.trimmingClipUri = clip.uri },
+                    onPlayClick = { playVideo(context, clip.uri) },
+                    onTrimClick = { vm.trimmingClipUri = clip.uri }
+                )
+            }
+        }
+    }
+}
+
+// ============================ Audio screen ============================
+
+@Composable
+private fun AudioScreen(
+    vm: MainViewModel,
+    musicPicker: androidx.activity.compose.ManagedActivityResultLauncher<Array<String>, Uri?>,
+    onStartSaveAs: (List<Uri>) -> Unit,
+    onCancelMerge: () -> Unit
+) {
+    val context = LocalContext.current
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 16.dp, vertical = 12.dp)
+    ) {
+        Text(
+            "Pick clip(s), then add background music. Output is a single re-encoded video.",
+            fontSize = 12.sp,
+            color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.7f)
+        )
+
+        Spacer(Modifier.height(12.dp))
+
+        MusicChip(vm = vm, musicPicker = musicPicker)
+
+        Spacer(Modifier.height(12.dp))
+
+        LazyColumn(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            items(vm.clips) { clip ->
+                ClipRow(
+                    clip = clip,
+                    clipEdit = vm.getEditForClip(clip.uri),
+                    selectionIndex = vm.selectionOrder.indexOf(clip.uri).takeIf { it >= 0 },
+                    manageMode = false,
+                    onClick = { vm.toggleSelection(clip.uri) },
+                    onPlayClick = { playVideo(context, clip.uri) },
+                    onTrimClick = { vm.trimmingClipUri = clip.uri }
+                )
+            }
+        }
+
+        if (vm.selectionOrder.isNotEmpty() && vm.musicUri != null && !vm.isProcessing) {
+            Spacer(Modifier.height(8.dp))
+            Button(
+                onClick = { onStartSaveAs(vm.selectionOrder) },
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.secondary,
+                    contentColor = MaterialTheme.colorScheme.onSecondary
+                )
+            ) {
+                Icon(Icons.Filled.MusicNote, null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("Produce with music (${vm.selectionOrder.size} clip(s))")
+            }
+        }
+
+        if (vm.isProcessing) {
+            Spacer(Modifier.height(12.dp))
+            LinearProgressIndicator(
+                progress = { vm.progress.coerceIn(0f, 1f) },
+                modifier = Modifier.fillMaxWidth(),
+                color = MaterialTheme.colorScheme.primary
             )
-        } else {
-            // Clip disappeared (deleted/refreshed) — close the dialog
-            vm.trimmingClipUri = null
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("${(vm.progress * 100).toInt()}%", fontSize = 12.sp)
+                TextButton(onClick = onCancelMerge) { Text("Cancel") }
+            }
+        }
+    }
+}
+
+// ============================ Shared components ============================
+
+@Composable
+private fun MusicChip(
+    vm: MainViewModel,
+    musicPicker: androidx.activity.compose.ManagedActivityResultLauncher<Array<String>, Uri?>
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
+            .clickable { musicPicker.launch(arrayOf("audio/*")) }
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(
+            Icons.Filled.MusicNote,
+            null,
+            modifier = Modifier.size(20.dp),
+            tint = if (vm.musicUri != null) MaterialTheme.colorScheme.primary
+                else MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Spacer(Modifier.width(10.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            if (vm.musicUri != null) {
+                Text("Music: ${vm.musicName ?: "audio"}",
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.primary,
+                    maxLines = 1)
+                Text("Tap to change  •  loops if shorter than video",
+                    fontSize = 10.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+            } else {
+                Text("Add background music", fontSize = 13.sp,
+                    color = MaterialTheme.colorScheme.onSurface)
+                Text("Will require re-encoding (slower)", fontSize = 10.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+        if (vm.musicUri != null) {
+            TextButton(
+                onClick = { vm.setMusic(null, null) },
+                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
+            ) {
+                Text("Remove", fontSize = 11.sp)
+            }
         }
     }
 }
@@ -1058,9 +1394,9 @@ fun ClipRow(
     }
     val bgColor = when {
         manageMode && isSelected -> MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.3f)
-        else -> MaterialTheme.colorScheme.surfaceVariant
+        isSelected -> MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.2f)
+        else -> MaterialTheme.colorScheme.surface
     }
-
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -1071,22 +1407,18 @@ fun ClipRow(
             .padding(start = 4.dp, end = 10.dp, top = 4.dp, bottom = 4.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        // Play icon — always shown, always clickable (regardless of mode).
-        // Tapping it opens the clip in the system video player rather than selecting.
-        IconButton(
-            onClick = onPlayClick,
-            modifier = Modifier.size(40.dp)
-        ) {
+        IconButton(onClick = onPlayClick, modifier = Modifier.size(40.dp)) {
             Icon(
                 Icons.Filled.PlayCircle,
-                contentDescription = "Play in system video player",
+                "Play",
                 tint = MaterialTheme.colorScheme.primary,
                 modifier = Modifier.size(28.dp)
             )
         }
         Spacer(Modifier.width(4.dp))
         Column(modifier = Modifier.weight(1f)) {
-            Text(clip.name, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, maxLines = 1)
+            Text(clip.name, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, maxLines = 1,
+                color = MaterialTheme.colorScheme.onSurface)
             val trimSuffix = if (clipEdit.hasEdits()) {
                 val effDuration = clipEdit.effectiveDurationMs(clip.durationSec * 1000L) / 1000
                 val effRanges = clipEdit.effectiveRanges(clip.durationSec * 1000L)
@@ -1097,57 +1429,50 @@ fun ClipRow(
                 "${formatDuration(clip.durationSec)}  •  ${"%.1f".format(clip.sizeMb)} MB$trimSuffix",
                 fontSize = 11.sp,
                 color = if (clipEdit.hasEdits()) MaterialTheme.colorScheme.primary
-                    else MaterialTheme.colorScheme.onSurfaceVariant
+                    else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
             )
         }
-        // Trim button - shown when not in manage mode
         if (!manageMode) {
-            IconButton(
-                onClick = onTrimClick,
-                modifier = Modifier.size(36.dp)
-            ) {
+            IconButton(onClick = onTrimClick, modifier = Modifier.size(36.dp)) {
                 Icon(
                     Icons.Filled.ContentCut,
-                    contentDescription = "Trim clip",
+                    "Trim",
                     tint = if (clipEdit.hasEdits()) MaterialTheme.colorScheme.primary
-                        else MaterialTheme.colorScheme.onSurfaceVariant,
+                        else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f),
                     modifier = Modifier.size(18.dp)
                 )
             }
         }
-        // Right-side indicator: depends on mode + selection
         when {
-            manageMode && isSelected -> {
-                Icon(
-                    Icons.Filled.Delete,
-                    null,
-                    tint = MaterialTheme.colorScheme.error,
-                    modifier = Modifier.size(24.dp)
-                )
-            }
-            !manageMode && isSelected && selectionIndex != null -> {
-                Box(
-                    modifier = Modifier.size(24.dp).clip(RoundedCornerShape(12.dp))
-                        .background(MaterialTheme.colorScheme.primary),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text("${selectionIndex + 1}",
-                        color = MaterialTheme.colorScheme.onPrimary,
-                        fontWeight = FontWeight.Bold, fontSize = 11.sp)
-                }
-            }
-            else -> {
-                // Empty space placeholder to keep layout consistent
-                Spacer(Modifier.size(24.dp))
+            manageMode && isSelected -> Icon(
+                Icons.Filled.Delete, null,
+                tint = MaterialTheme.colorScheme.error,
+                modifier = Modifier.size(24.dp)
+            )
+            !manageMode && isSelected && selectionIndex != null -> Box(
+                modifier = Modifier
+                    .size(24.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(MaterialTheme.colorScheme.primary),
+                contentAlignment = Alignment.Center
+            ) {
+                Text("${selectionIndex + 1}",
+                    color = MaterialTheme.colorScheme.onPrimary,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold)
             }
         }
     }
 }
 
-/**
- * Open the given video URI in the system's default video player.
- * Uses ACTION_VIEW; Android shows a chooser if multiple players are installed.
- */
+fun formatDuration(totalSeconds: Long): String {
+    val h = totalSeconds / 3600
+    val m = (totalSeconds % 3600) / 60
+    val s = totalSeconds % 60
+    return if (h > 0) "%d:%02d:%02d".format(h, m, s)
+        else "%d:%02d".format(m, s)
+}
+
 fun playVideo(context: android.content.Context, uri: Uri) {
     try {
         val intent = Intent(Intent.ACTION_VIEW).apply {
@@ -1159,10 +1484,8 @@ fun playVideo(context: android.content.Context, uri: Uri) {
         chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         context.startActivity(chooser)
     } catch (e: Exception) {
-        Toast.makeText(
-            context,
+        Toast.makeText(context,
             "No video player found. Install a video player from Play Store.",
-            Toast.LENGTH_LONG
-        ).show()
+            Toast.LENGTH_LONG).show()
     }
 }
