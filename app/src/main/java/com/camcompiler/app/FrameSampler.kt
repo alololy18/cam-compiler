@@ -61,14 +61,28 @@ object FrameSampler {
                 extractor.selectTrack(videoTrack)
                 extractor.seekTo(0L, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
 
+                // Hop directly between sync samples using SEEK_TO_NEXT_SYNC.
+                // Each iteration: read current sample's time (it's a sync sample because
+                // we either started with SEEK_TO_CLOSEST_SYNC or just did SEEK_TO_NEXT_SYNC),
+                // record it, then seek slightly past it to find the next one.
+                //
+                // Speed: this does roughly N seeks for N keyframes, where the per-sample
+                // walk would advance() through every frame (potentially 30N - 60N samples).
+                // For a 30-minute clip with keyframes every 1-2s, this is 30-50× faster.
+                //
+                // Safety: we break out if the timestamp stops advancing or returns -1
+                // (end of stream), so we can't loop forever on a pathological container.
+                var lastT = Long.MIN_VALUE
                 while (true) {
                     coroutineContext.ensureActive()
-                    val flags = extractor.sampleFlags
-                    if (flags and MediaExtractor.SAMPLE_FLAG_SYNC != 0) {
-                        val timeUs = extractor.sampleTime
-                        if (timeUs >= 0) timestamps.add(timeUs / 1000L)
-                    }
-                    if (!extractor.advance()) break
+                    val t = extractor.sampleTime
+                    if (t < 0) break  // end of stream
+                    if (t <= lastT) break  // no forward progress — defensive bail
+                    timestamps.add(t / 1000L)
+                    lastT = t
+                    // Hop to the next sync sample after this one. The +1us ensures we
+                    // don't land on the same sample again.
+                    extractor.seekTo(t + 1L, MediaExtractor.SEEK_TO_NEXT_SYNC)
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "extractKeyframeTimestamps failed for $uri: ${e.message}")
