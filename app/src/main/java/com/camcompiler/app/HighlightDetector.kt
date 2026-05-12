@@ -361,13 +361,14 @@ class HighlightDetector(
                 }
 
                 // Compute scene change (vs window-start frame) and motion (vs prev) at each sample
-                val firstBmp = sampler.frameAt(sampleTimes[0], syncOnly = false)
-                if (firstBmp == null) {
+                val firstBmpRaw = sampler.frameAt(sampleTimes[0], syncOnly = false)
+                if (firstBmpRaw == null) {
                     refined.add(cand)  // can't refine — keep raw
                     continue
                 }
+                val firstBmp: android.graphics.Bitmap = firstBmpRaw  // smart-cast confirmed non-null
                 val baseHist = FrameSampler.yHistogram(firstBmp)
-                var prevBmp = firstBmp
+                var prevBmp: android.graphics.Bitmap = firstBmp
 
                 var bestT = cand.peakMs
                 var bestScore = cand.score
@@ -375,7 +376,7 @@ class HighlightDetector(
                 for (i in 1 until n) {
                     coroutineContext.ensureActive()
                     val tMs = sampleTimes[i]
-                    val bmp = sampler.frameAt(tMs, syncOnly = false) ?: continue
+                    val bmp: android.graphics.Bitmap = sampler.frameAt(tMs, syncOnly = false) ?: continue
                     val hist = FrameSampler.yHistogram(bmp)
                     val corr = FrameSampler.histogramCorrelation(baseHist, hist)
                     val sceneSub = (1f - corr).coerceIn(0f, 1f)
