@@ -36,8 +36,8 @@ class HighlightDetector(
     companion object {
         private const val TAG = "HighlightDetector"
 
-        // Minimum gap between adjacent peaks to count them as distinct (in score-array indices,
-        // which correspond roughly to keyframes — typically 1-2s apart).
+        // Minimum gap between adjacent peaks to count them as distinct (in score-array indices).
+        // With 1.5s sampling, MIN_PEAK_GAP_SAMPLES=4 means peaks must be 6+ seconds apart.
         private const val MIN_PEAK_GAP_SAMPLES = 4
 
         // After window expansion, refinement samples this many times inside the window for
@@ -50,6 +50,14 @@ class HighlightDetector(
 
         // Deduplication: candidates whose windows overlap or are within this distance get merged.
         private const val MERGE_GAP_MS = 2_000L
+
+        // Sample frames every N ms during the scoring pass. 1500ms is a good balance:
+        // - Fast: a 30-min clip needs only 1200 samples instead of ~54,000 frames
+        // - Accurate: detects scene changes within ±0.75s, which is plenty for 15s windows
+        // - Aligned with typical keyframe intervals: MediaMetadataRetriever's
+        //   OPTION_CLOSEST_SYNC will land us on the nearest keyframe, so we get clean,
+        //   fast-to-decode frames without an explicit keyframe index.
+        private const val SAMPLE_INTERVAL_MS = 1500L
     }
 
     /**
@@ -101,37 +109,45 @@ class HighlightDetector(
             val clipFractionBase = clipDurations.take(clipIdx).sum().toFloat() / totalDurMs.toFloat()
             val clipFractionSize = clipDurations[clipIdx].toFloat() / totalDurMs.toFloat()
 
-            // --- PASS 1: I-frame index ---
+            // --- PASS 1+2: synthesize sample timestamps and score them in one pass ---
+            //
+            // We skip the explicit "find every keyframe" indexing step because:
+            // 1) MediaExtractor scanning of content:// URIs is extremely slow on Android
+            //    (each seek may re-buffer the file via ContentResolver — minutes for a 200MB file)
+            // 2) For highlight detection, we don't need every keyframe — we just need
+            //    samples spread across the clip's duration
+            //
+            // MediaMetadataRetriever.getFrameAtTime(t, OPTION_CLOSEST_SYNC) gives us the
+            // nearest sync sample to each target time, which is exactly what we want:
+            // fast-to-decode keyframes at predictable intervals.
             progressChannel.send(DetectionProgress(
-                phase = DetectionPhase.INDEXING,
+                phase = DetectionPhase.SCORING,
                 percent = clipFractionBase,
                 currentClipIdx = clipIdx,
                 totalClips = clips.size,
             ))
-            val kfTimestamps = FrameSampler.extractKeyframeTimestamps(ctx, clip.uri)
-            if (kfTimestamps.size < 3) {
-                Log.w(TAG, "Clip ${clip.name} has < 3 keyframes; skipping")
+            val clipDurMs = clipDurations[clipIdx]
+            if (clipDurMs < SAMPLE_INTERVAL_MS * 3) {
+                Log.w(TAG, "Clip ${clip.name} too short for sampling (${clipDurMs}ms); skipping")
                 continue
             }
-            Log.d(TAG, "Clip ${clip.name}: ${kfTimestamps.size} keyframes")
+            val sampleTimestamps = buildList {
+                var t = 0L
+                while (t < clipDurMs) {
+                    add(t)
+                    t += SAMPLE_INTERVAL_MS
+                }
+            }
+            Log.d(TAG, "Clip ${clip.name}: ${sampleTimestamps.size} sample timestamps")
 
-            // --- PASS 2: Sample + score each keyframe in a SINGLE pass ---
-            // We compute scene-change AND motion-MAD as we walk frames.
-            // To keep memory bounded, we only retain the previous frame's bitmap (recycled each step).
-            progressChannel.send(DetectionProgress(
-                phase = DetectionPhase.SCORING,
-                percent = clipFractionBase + clipFractionSize * 0.1f,
-                currentClipIdx = clipIdx,
-                totalClips = clips.size,
-            ))
             val curve = computeScoreCurveSinglePass(
                 ctx = ctx,
                 clip = clip,
-                keyframeTimestamps = kfTimestamps,
+                keyframeTimestamps = sampleTimestamps,
                 onProgress = { kfIdx, total ->
-                    if (kfIdx % 16 == 0) {
+                    if (kfIdx % 8 == 0) {
                         val kfProgress = kfIdx.toFloat() / total.toFloat()
-                        val overall = clipFractionBase + clipFractionSize * (0.1f + 0.7f * kfProgress)
+                        val overall = clipFractionBase + clipFractionSize * (0.05f + 0.75f * kfProgress)
                         val elapsedMs = System.currentTimeMillis() - startTimeMs
                         val estTotalMs = if (overall > 0.02f) (elapsedMs / overall).toLong() else 0L
                         val estRemainingMs = (estTotalMs - elapsedMs).coerceAtLeast(0L)
@@ -188,15 +204,10 @@ class HighlightDetector(
             ))
             val refined = refinePeaks(ctx, clip, clipDurations[clipIdx], rawCandidates)
 
-            // Snap window edges to keyframes for clean cuts
-            val snappedKfs = kfTimestamps  // same list, used as keyframe index
-            val withSnap = refined.map { c ->
-                val newStart = snapToKeyframeAtOrBefore(snappedKfs, c.startMs)
-                val newEnd = snapToKeyframeAtOrAfter(snappedKfs, c.endMs, clipDurations[clipIdx])
-                c.copy(startMs = newStart, endMs = newEnd)
-            }
-
-            allCandidates += withSnap
+            // No keyframe snapping: we always re-encode the output (transitions need it),
+            // so range edges don't need to align with keyframes. The slight ~750ms variance
+            // in start/end times from sample-interval rounding is acceptable for a 15s window.
+            allCandidates += refined
         }
 
         // --- PASS 6: global dedup + ranking across all clips ---
@@ -406,26 +417,6 @@ class HighlightDetector(
             }
         }
         return refined
-    }
-
-    private fun snapToKeyframeAtOrBefore(keyframes: List<Long>, ms: Long): Long {
-        if (keyframes.isEmpty()) return ms
-        var best = keyframes[0]
-        for (kf in keyframes) {
-            if (kf <= ms) best = kf else break
-        }
-        // If snap distance > 2 seconds, don't snap (avoid weird jumps)
-        return if (ms - best > 2_000L) ms else best
-    }
-
-    private fun snapToKeyframeAtOrAfter(keyframes: List<Long>, ms: Long, maxMs: Long): Long {
-        if (keyframes.isEmpty()) return ms
-        for (kf in keyframes) {
-            if (kf >= ms) {
-                return if (kf - ms > 2_000L) ms else kf
-            }
-        }
-        return ms.coerceAtMost(maxMs)
     }
 
     /**
