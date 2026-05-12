@@ -290,7 +290,7 @@ private fun HighlightsPickerScreen(
                 val selectedClips = vm.clips.filter { it.uri in state.selectedClipUris }
                 if (selectedClips.isEmpty()) return@Button
                 state.mode = HighlightsState.Mode.ANALYZING
-                state.progress = DetectionProgress(DetectionPhase.INDEXING, 0f, totalClips = selectedClips.size)
+                state.progress = DetectionProgress(DetectionPhase.SCORING, 0f, totalClips = selectedClips.size)
                 state.errorMessage = null
                 val detector = HighlightDetector(context, selectedClips, state.settings)
                 state.detectorJob = scope.launch {
