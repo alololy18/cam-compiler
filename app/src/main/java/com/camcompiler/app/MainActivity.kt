@@ -65,7 +65,7 @@ import java.util.Locale
 
 class MainViewModel(app: Application) : AndroidViewModel(app) {
     // Hub-and-spoke navigation state
-    enum class Screen { HUB, MERGE, MERGE_PRO, EDIT, AUDIO }
+    enum class Screen { HUB, MERGE, MERGE_PRO, EDIT, AUDIO, HIGHLIGHTS }
     var currentScreen by mutableStateOf(Screen.HUB)
 
     var folderUri by mutableStateOf<Uri?>(null); private set
@@ -132,6 +132,16 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     // Trim dialog state — which clip URI is being trimmed (null = not open)
     var trimmingClipUri by mutableStateOf<Uri?>(null)
+
+    // Highlights feature state — owned by ViewModel so it survives screen rotation
+    val highlightsState = HighlightsState()
+
+    /**
+     * When the user exports from the Highlights screen, we stash the selected
+     * candidates + transitions here so startMerge() can build the right EditProject.
+     */
+    var pendingHighlights: List<HighlightCandidate>? = null
+    var pendingHighlightTransitions: List<Transition>? = null
 
     fun setClipEdit(uri: Uri, edit: ClipEdit) {
         clipEdits = clipEdits + (uri to edit)
@@ -451,13 +461,21 @@ class MainActivity : ComponentActivity() {
                             Toast.LENGTH_LONG).show()
                         // Refresh folder in case the merged file was saved into it
                         vm.refreshFolder()
+                        // Don't prompt to delete sources after a Highlights export — the
+                        // user almost certainly wants to keep the originals for future runs.
+                        val isHighlightsExport = vm.pendingHighlights != null
                         val srcUris = mergeService?.lastSourceUris ?: emptyList()
-                        if (srcUris.isNotEmpty()) {
+                        if (srcUris.isNotEmpty() && !isHighlightsExport) {
                             vm.postMergeSourceUris = srcUris
                             vm.showDeletePromptAfterMerge = true
                         }
+                        // Clear pending highlights state so next merge starts clean
+                        vm.pendingHighlights = null
+                        vm.pendingHighlightTransitions = null
                     } else if (result is MergeEngine.Result.Failure) {
                         Toast.makeText(this@MainActivity, "Failed: ${result.message}", Toast.LENGTH_LONG).show()
+                        vm.pendingHighlights = null
+                        vm.pendingHighlightTransitions = null
                     }
                 }
             }
@@ -504,6 +522,16 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun beginSaveAs(uris: List<Uri>) {
+        // Special-case Highlights flow: we KNOW it requires re-encoding (transitions between
+        // segments) and the URIs may come from disparate clips. Skip codec analysis and go
+        // straight to the save-as picker in COMPATIBLE mode.
+        if (vm.currentScreen == MainViewModel.Screen.HIGHLIGHTS) {
+            vm.status = "Building highlight reel — re-encoding required."
+            pendingMode = MergeEngine.Mode.COMPATIBLE
+            launchSaveAsDialog(uris)
+            return
+        }
+
         vm.status = "Analyzing clips..."
         vm.isProcessing = false
         lifecycleScope.launch {
@@ -655,6 +683,12 @@ class MainActivity : ComponentActivity() {
                 includeMusic = false,
                 forceReencode = false
             )
+            MainViewModel.Screen.HIGHLIGHTS -> {
+                // Build a multi-clip project where each source clip contributes only its
+                // selected highlight ranges. Inter-highlight transitions come from the
+                // user's choices in the review screen.
+                buildHighlightProject(vm)
+            }
             else -> vm.buildEditProject(
                 uris,
                 includeTransitions = false,
@@ -664,6 +698,72 @@ class MainActivity : ComponentActivity() {
         }
         MergeService.start(this, project, outputUri, mode)
         bindService(Intent(this, MergeService::class.java), connection, Context.BIND_AUTO_CREATE)
+    }
+
+    /**
+     * Build an EditProject from the highlights stashed in the ViewModel.
+     * For each source clip that contributed any highlights, create a ClipEdit with
+     * those ranges in KEEP_RANGES mode. Inter-highlight transitions become
+     * range-transitions (within a clip) and clip-transitions (between clips).
+     */
+    private fun buildHighlightProject(vm: MainViewModel): EditProject {
+        val candidates = vm.pendingHighlights ?: emptyList()
+        val transitions = vm.pendingHighlightTransitions ?: emptyList()
+
+        if (candidates.isEmpty()) {
+            // Defensive — should never reach here
+            return EditProject(clipEdits = emptyList(), forceReencode = true)
+        }
+
+        // Group candidates by source URI, preserving order within each group
+        val byUri = LinkedHashMap<Uri, MutableList<Int>>()  // uri -> list of indices into candidates
+        for ((i, c) in candidates.withIndex()) {
+            byUri.getOrPut(c.sourceUri) { mutableListOf() }.add(i)
+        }
+
+        // Build ClipEdits, one per source clip
+        val clipEdits = byUri.entries.map { (uri, indices) ->
+            val ranges = indices.map { idx ->
+                val c = candidates[idx]
+                TrimRange(c.startMs, c.endMs)
+            }
+            // Range-transitions: the transition between candidates that BOTH belong to this clip.
+            // We walk pairs of consecutive indices in the original candidates list.
+            val rangeTrans = mutableListOf<Transition>()
+            for (j in 0 until indices.size - 1) {
+                val a = indices[j]
+                val b = indices[j + 1]
+                if (b == a + 1) {
+                    // Adjacent in the global list AND both in this clip → use that transition
+                    rangeTrans.add(transitions.getOrElse(a) { Transition.NONE })
+                } else {
+                    // Non-adjacent — fill with NONE (shouldn't happen if candidates are grouped contiguously)
+                    rangeTrans.add(Transition.NONE)
+                }
+            }
+            ClipEdit(
+                sourceUri = uri,
+                ranges = ranges,
+                mode = TrimMode.KEEP_RANGES,
+                rangeTransitions = rangeTrans
+            )
+        }
+
+        // Clip-transitions: the transition between the LAST candidate of clip N and
+        // the FIRST candidate of clip N+1.
+        val uris = byUri.keys.toList()
+        val clipTrans = mutableListOf<Transition>()
+        for (k in 0 until uris.size - 1) {
+            val lastIdxThisClip = byUri[uris[k]]!!.last()
+            // Transition[lastIdxThisClip] is the one immediately after that candidate
+            clipTrans.add(transitions.getOrElse(lastIdxThisClip) { Transition.NONE })
+        }
+
+        return EditProject(
+            clipEdits = clipEdits,
+            clipTransitions = clipTrans,
+            forceReencode = true
+        )
     }
 
     private fun cancelMerge() {
@@ -741,6 +841,38 @@ fun AppScreen(
                 musicPicker = musicPicker,
                 onStartSaveAs = onStartSaveAs,
                 onCancelMerge = onCancelMerge
+            )
+            MainViewModel.Screen.HIGHLIGHTS -> HighlightsScreen(
+                vm = vm,
+                state = vm.highlightsState,
+                onExport = { _, candidates, transitions ->
+                    // Stash the highlights and trigger save-as with the unique source URIs.
+                    // startMerge() will see them via vm.pendingHighlights and build the right project.
+                    vm.pendingHighlights = candidates
+                    vm.pendingHighlightTransitions = transitions
+                    val uniqueUris = candidates.map { it.sourceUri }.distinct()
+                    onStartSaveAs(uniqueUris)
+                },
+                onRefineInEdit = { cand ->
+                    // Pre-populate the trim dialog with the highlights from this single source clip
+                    val sameClipCands = vm.highlightsState.displayedCandidates
+                        .filter { it.sourceUri == cand.sourceUri }
+                    val ranges = sameClipCands.map { TrimRange(it.startMs, it.endMs) }
+                    val transitions = vm.highlightsState.transitions
+                        .filterIndexed { idx, _ ->
+                            // Only keep transitions between same-clip candidates
+                            idx < sameClipCands.size - 1
+                        }
+                    val edit = ClipEdit(
+                        sourceUri = cand.sourceUri,
+                        ranges = ranges,
+                        mode = TrimMode.KEEP_RANGES,
+                        rangeTransitions = transitions
+                    )
+                    vm.setClipEdit(cand.sourceUri, edit)
+                    vm.trimmingClipUri = cand.sourceUri
+                    vm.currentScreen = MainViewModel.Screen.EDIT
+                }
             )
         }
     }
@@ -892,6 +1024,7 @@ private fun TopBar(
         MainViewModel.Screen.MERGE_PRO -> "Merge"
         MainViewModel.Screen.EDIT -> "Edit Clip"
         MainViewModel.Screen.AUDIO -> "Replace Audio"
+        MainViewModel.Screen.HIGHLIGHTS -> "Auto Highlights"
     }
     Row(
         modifier = Modifier
@@ -1178,12 +1311,12 @@ private fun HubScreen(
                 horizontalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 TaskTile(
-                    icon = Icons.Filled.Tune,
-                    label = "Filters",
-                    sublabel = "Coming soon",
-                    enabled = false,
+                    icon = Icons.Filled.AutoAwesome,
+                    label = "Highlights",
+                    sublabel = "Auto-detect moments",
+                    enabled = hasFolder,
                     modifier = Modifier.weight(1f),
-                    onClick = { }
+                    onClick = { onSelectTask(MainViewModel.Screen.HIGHLIGHTS) }
                 )
                 TaskTile(
                     icon = Icons.Filled.PlayCircle,
