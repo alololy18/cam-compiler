@@ -310,7 +310,7 @@ private fun ClipRadioRow(clip: VideoClip, selected: Boolean, onSelect: () -> Uni
                 overflow = TextOverflow.Ellipsis,
             )
             Text(
-                "${clip.formatDuration()} · ${"%.1f".format(clip.sizeMb)} MB",
+                "${formatDuration(clip.durationSec)} · ${"%.1f".format(clip.sizeMb)} MB",
                 fontSize = 12.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
