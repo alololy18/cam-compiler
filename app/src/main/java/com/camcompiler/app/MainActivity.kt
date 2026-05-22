@@ -38,6 +38,7 @@ import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.PlayCircle
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.SwapHoriz
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.Warning
@@ -65,7 +66,7 @@ import java.util.Locale
 
 class MainViewModel(app: Application) : AndroidViewModel(app) {
     // Hub-and-spoke navigation state
-    enum class Screen { HUB, MERGE, MERGE_PRO, EDIT, AUDIO, HIGHLIGHTS }
+    enum class Screen { HUB, MERGE, MERGE_PRO, EDIT, AUDIO, HIGHLIGHTS, FIND_MOMENT }
     var currentScreen by mutableStateOf(Screen.HUB)
 
     var folderUri by mutableStateOf<Uri?>(null); private set
@@ -142,6 +143,17 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      */
     var pendingHighlights: List<HighlightCandidate>? = null
     var pendingHighlightTransitions: List<Transition>? = null
+
+    // Find Moment (natural-language search) feature state
+    val findMomentState = FindMomentState()
+
+    /**
+     * When the user exports from Find Moment, we stash the selected MatchCandidates
+     * + transitions here so startMerge() can build the right EditProject.
+     * Mode A puts one candidate, Mode B puts N candidates + N-1 transitions.
+     */
+    var pendingFindMomentCandidates: List<MatchCandidate>? = null
+    var pendingFindMomentTransitions: List<Transition>? = null
 
     fun setClipEdit(uri: Uri, edit: ClipEdit) {
         clipEdits = clipEdits + (uri to edit)
@@ -461,21 +473,26 @@ class MainActivity : ComponentActivity() {
                             Toast.LENGTH_LONG).show()
                         // Refresh folder in case the merged file was saved into it
                         vm.refreshFolder()
-                        // Don't prompt to delete sources after a Highlights export — the
-                        // user almost certainly wants to keep the originals for future runs.
-                        val isHighlightsExport = vm.pendingHighlights != null
+                        // Don't prompt to delete sources after a Highlights or Find Moment
+                        // export — the user almost certainly wants to keep the originals.
+                        val isAutoExport = vm.pendingHighlights != null ||
+                                           vm.pendingFindMomentCandidates != null
                         val srcUris = mergeService?.lastSourceUris ?: emptyList()
-                        if (srcUris.isNotEmpty() && !isHighlightsExport) {
+                        if (srcUris.isNotEmpty() && !isAutoExport) {
                             vm.postMergeSourceUris = srcUris
                             vm.showDeletePromptAfterMerge = true
                         }
-                        // Clear pending highlights state so next merge starts clean
+                        // Clear pending state so next merge starts clean
                         vm.pendingHighlights = null
                         vm.pendingHighlightTransitions = null
+                        vm.pendingFindMomentCandidates = null
+                        vm.pendingFindMomentTransitions = null
                     } else if (result is MergeEngine.Result.Failure) {
                         Toast.makeText(this@MainActivity, "Failed: ${result.message}", Toast.LENGTH_LONG).show()
                         vm.pendingHighlights = null
                         vm.pendingHighlightTransitions = null
+                        vm.pendingFindMomentCandidates = null
+                        vm.pendingFindMomentTransitions = null
                     }
                 }
             }
@@ -522,11 +539,12 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun beginSaveAs(uris: List<Uri>) {
-        // Special-case Highlights flow: we KNOW it requires re-encoding (transitions between
-        // segments) and the URIs may come from disparate clips. Skip codec analysis and go
-        // straight to the save-as picker in COMPATIBLE mode.
-        if (vm.currentScreen == MainViewModel.Screen.HIGHLIGHTS) {
-            vm.status = "Building highlight reel — re-encoding required."
+        // Special-case Highlights and Find Moment flows: we KNOW they require re-encoding
+        // (transitions between segments) and the URIs may come from disparate clips.
+        // Skip codec analysis and go straight to the save-as picker in COMPATIBLE mode.
+        if (vm.currentScreen == MainViewModel.Screen.HIGHLIGHTS ||
+            vm.currentScreen == MainViewModel.Screen.FIND_MOMENT) {
+            vm.status = "Building output — re-encoding required."
             pendingMode = MergeEngine.Mode.COMPATIBLE
             launchSaveAsDialog(uris)
             return
@@ -689,6 +707,12 @@ class MainActivity : ComponentActivity() {
                 // user's choices in the review screen.
                 buildHighlightProject(vm)
             }
+            MainViewModel.Screen.FIND_MOMENT -> {
+                // Build a project from the matched moments stashed in the VM.
+                // Mode A: one candidate → one range in one clip.
+                // Mode B: N candidates → N ranges in one clip + N-1 transitions.
+                buildFindMomentProject(vm)
+            }
             else -> vm.buildEditProject(
                 uris,
                 includeTransitions = false,
@@ -762,6 +786,39 @@ class MainActivity : ComponentActivity() {
         return EditProject(
             clipEdits = clipEdits,
             clipTransitions = clipTrans,
+            forceReencode = true
+        )
+    }
+
+    /**
+     * Build an EditProject from the find-moment match candidates stashed in the VM.
+     *
+     * All candidates come from a SINGLE clip (Find Moment is single-clip in Phase 1),
+     * so we produce one ClipEdit with N ranges in KEEP_RANGES mode and N-1 range transitions.
+     */
+    private fun buildFindMomentProject(vm: MainViewModel): EditProject {
+        val candidates = vm.pendingFindMomentCandidates ?: emptyList()
+        val transitions = vm.pendingFindMomentTransitions ?: emptyList()
+
+        if (candidates.isEmpty()) {
+            return EditProject(clipEdits = emptyList(), forceReencode = true)
+        }
+
+        val uri = candidates.first().sourceUri  // all candidates share one source clip
+        val ranges = candidates.map { TrimRange(it.startMs, it.endMs) }
+        val rangeTrans = (0 until ranges.size - 1).map { i ->
+            transitions.getOrElse(i) { Transition.NONE }
+        }
+
+        return EditProject(
+            clipEdits = listOf(
+                ClipEdit(
+                    sourceUri = uri,
+                    ranges = ranges,
+                    mode = TrimMode.KEEP_RANGES,
+                    rangeTransitions = rangeTrans
+                )
+            ),
             forceReencode = true
         )
     }
@@ -872,6 +929,23 @@ fun AppScreen(
                     vm.setClipEdit(cand.sourceUri, edit)
                     vm.trimmingClipUri = cand.sourceUri
                     vm.currentScreen = MainViewModel.Screen.EDIT
+                }
+            )
+            MainViewModel.Screen.FIND_MOMENT -> FindMomentScreen(
+                vm = vm,
+                state = vm.findMomentState,
+                onExportModeA = { cand, transition ->
+                    // Mode A: one candidate, no inter-segment transitions needed
+                    vm.pendingFindMomentCandidates = listOf(cand)
+                    vm.pendingFindMomentTransitions = emptyList()
+                    onStartSaveAs(listOf(cand.sourceUri))
+                },
+                onExportModeB = { candidates, transitions ->
+                    // Mode B: multiple candidates from the same clip
+                    vm.pendingFindMomentCandidates = candidates
+                    vm.pendingFindMomentTransitions = transitions
+                    val srcUri = candidates.firstOrNull()?.sourceUri ?: return@FindMomentScreen
+                    onStartSaveAs(listOf(srcUri))
                 }
             )
         }
@@ -1025,6 +1099,7 @@ private fun TopBar(
         MainViewModel.Screen.EDIT -> "Edit Clip"
         MainViewModel.Screen.AUDIO -> "Replace Audio"
         MainViewModel.Screen.HIGHLIGHTS -> "Auto Highlights"
+        MainViewModel.Screen.FIND_MOMENT -> "Find Moment"
     }
     Row(
         modifier = Modifier
@@ -1319,12 +1394,12 @@ private fun HubScreen(
                     onClick = { onSelectTask(MainViewModel.Screen.HIGHLIGHTS) }
                 )
                 TaskTile(
-                    icon = Icons.Filled.PlayCircle,
-                    label = "Beat sync",
-                    sublabel = "Coming soon",
-                    enabled = false,
+                    icon = Icons.Filled.Search,
+                    label = "Find moment",
+                    sublabel = "Describe what you want",
+                    enabled = hasFolder,
                     modifier = Modifier.weight(1f),
-                    onClick = { }
+                    onClick = { onSelectTask(MainViewModel.Screen.FIND_MOMENT) }
                 )
             }
         }
