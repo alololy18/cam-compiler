@@ -1,268 +1,759 @@
-Run ./gradlew assembleDebug --no-daemon --stacktrace
-Downloading https://services.gradle.org/distributions/gradle-8.7-bin.zip
-............10%.............20%.............30%.............40%............50%.............60%.............70%.............80%.............90%............100%
-To honour the JVM settings for this build a single-use Daemon process will be forked. For more on this, please refer to https://docs.gradle.org/8.7/userguide/gradle_daemon.html#sec:disabling_the_daemon in the Gradle documentation.
-Daemon will be stopped at the end of the build 
-> Task :app:preBuild UP-TO-DATE
-> Task :app:preDebugBuild UP-TO-DATE
-> Task :app:mergeDebugNativeDebugMetadata NO-SOURCE
-> Task :app:checkKotlinGradlePluginConfigurationErrors
-> Task :app:generateDebugResValues
-> Task :app:checkDebugAarMetadata
-> Task :app:mapDebugSourceSetPaths
-> Task :app:generateDebugResources
-> Task :app:packageDebugResources
-> Task :app:mergeDebugResources
-> Task :app:createDebugCompatibleScreenManifests
-> Task :app:extractDeepLinksDebug
-> Task :app:parseDebugLocalResources
+// FILE: app/src/main/java/com/camcompiler/app/FindMomentScreen.kt
+package com.camcompiler.app
 
-> Task :app:processDebugMainManifest
-[org.tensorflow:tensorflow-lite:2.14.0] /home/runner/.gradle/caches/transforms-4/e1fe16525df8d3f8fee85c84360c554f/transformed/tensorflow-lite-2.14.0/AndroidManifest.xml Warning:
-	Namespace 'org.tensorflow.lite' is used in multiple modules and/or libraries: org.tensorflow:tensorflow-lite:2.14.0, org.tensorflow:tensorflow-lite-api:2.14.0. Please ensure that all modules and libraries have a unique namespace. For more information, See https://developer.android.com/studio/build/configure-app-module#set-namespace
-[org.tensorflow:tensorflow-lite-support:0.4.4] /home/runner/.gradle/caches/transforms-4/1b85a8ca66bdca175c130879c94edb3b/transformed/tensorflow-lite-support-0.4.4/AndroidManifest.xml Warning:
-	Namespace 'org.tensorflow.lite.support' is used in multiple modules and/or libraries: org.tensorflow:tensorflow-lite-support:0.4.4, org.tensorflow:tensorflow-lite-support-api:0.4.4. Please ensure that all modules and libraries have a unique namespace. For more information, See https://developer.android.com/studio/build/configure-app-module#set-namespace
+import android.net.Uri
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.Cancel
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardCapitalization
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
 
-> Task :app:processDebugManifest
-> Task :app:javaPreCompileDebug
-> Task :app:mergeDebugShaders
-> Task :app:compileDebugShaders NO-SOURCE
-> Task :app:generateDebugAssets UP-TO-DATE
-> Task :app:mergeDebugAssets
-> Task :app:desugarDebugFileDependencies
-> Task :app:compressDebugAssets
-> Task :app:mergeDebugStartupProfile
-> Task :app:mergeDebugJniLibFolders
-> Task :app:checkDebugDuplicateClasses
-> Task :app:mergeDebugNativeLibs
-> Task :app:processDebugManifestForPackage
-> Task :app:mergeExtDexDebug
-> Task :app:mergeLibDexDebug
+/**
+ * State for the Find Moment feature. Lives on the ViewModel so it survives
+ * configuration changes and tab navigation.
+ */
+class FindMomentState {
+    enum class Mode { PICKING, ANALYZING, REVIEWING }
 
-> Task :app:stripDebugDebugSymbols
-Unable to strip the following libraries, packaging them as they are: libandroidx.graphics.path.so, libdatastore_shared_counter.so, libtensorflowlite_jni.so.
+    var mode by mutableStateOf(Mode.PICKING)
 
-> Task :app:validateSigningDebug
-> Task :app:writeDebugAppMetadata
-> Task :app:writeDebugSigningConfigVersions
-> Task :app:processDebugResources
-> Task :app:compileDebugKotlin
-e: file:///home/runner/work/cam-compiler/cam-compiler/app/src/main/java/com/camcompiler/app/FindMomentScreen.kt:59:18 Platform declaration clash: The following declarations have the same JVM signature (setAnalysis(Lcom/camcompiler/app/FindMomentAnalysis;)V):
-    fun `<set-analysis>`(`<set-?>`: FindMomentAnalysis?): Unit defined in com.camcompiler.app.FindMomentState
-    fun setAnalysis(a: FindMomentAnalysis): Unit defined in com.camcompiler.app.FindMomentState
-e: file:///home/runner/work/cam-compiler/cam-compiler/app/src/main/java/com/camcompiler/app/FindMomentScreen.kt:77:5 Platform declaration clash: The following declarations have the same JVM signature (setAnalysis(Lcom/camcompiler/app/FindMomentAnalysis;)V):
-    fun `<set-analysis>`(`<set-?>`: FindMomentAnalysis?): Unit defined in com.camcompiler.app.FindMomentState
-    fun setAnalysis(a: FindMomentAnalysis): Unit defined in com.camcompiler.app.FindMomentState
+    // PICKING state
+    var selectedClipUri by mutableStateOf<Uri?>(null)
+    var query by mutableStateOf("")
+    var searchMode by mutableStateOf(FindMomentSettings.SearchMode.FIND_ONE_MOMENT)
+    var targetLengthSec by mutableStateOf(45)
+    var defaultTransition by mutableStateOf(Transition.FADE_BLACK)
 
-> Task :app:compileDebugKotlin FAILED
+    // ANALYZING state
+    var progress by mutableStateOf(
+        FindMomentProgress(FindMomentPhase.EMBEDDING_QUERIES, 0f)
+    )
+    var detectorJob: Job? = null
+    var expandedQueriesPreview by mutableStateOf<List<String>>(emptyList())
 
-30 actionable tasks: 30 executed
-FAILURE: Build failed with an exception.
+    // REVIEWING state
+    var analysis by mutableStateOf<FindMomentAnalysis?>(null)
+    var modeAChosenIdx by mutableStateOf<Int?>(null)  // which candidate user picked in Mode A
+    var modeBCandidates by mutableStateOf<List<MatchCandidate>>(emptyList())  // mutable for delete
+    var modeBTransitions by mutableStateOf<List<Transition>>(emptyList())
 
-* What went wrong:
-Execution failed for task ':app:compileDebugKotlin'.
-> A failure occurred while executing org.jetbrains.kotlin.compilerRunner.GradleCompilerRunnerWithWorkers$GradleKotlinCompilerWorkAction
-   > Compilation error. See log for more details
+    fun reset() {
+        mode = Mode.PICKING
+        selectedClipUri = null
+        query = ""
+        progress = FindMomentProgress(FindMomentPhase.EMBEDDING_QUERIES, 0f)
+        analysis = null
+        modeAChosenIdx = null
+        modeBCandidates = emptyList()
+        modeBTransitions = emptyList()
+        detectorJob = null
+        expandedQueriesPreview = emptyList()
+    }
 
-* Try:
-> Run with --info or --debug option to get more log output.
-> Run with --scan to get full insights.
-> Get more help at https://help.gradle.org.
+    fun applyAnalysis(a: FindMomentAnalysis) {
+        analysis = a
+        when (a.settings.mode) {
+            FindMomentSettings.SearchMode.FIND_ONE_MOMENT -> {
+                modeAChosenIdx = if (a.candidates.isNotEmpty()) 0 else null
+            }
+            FindMomentSettings.SearchMode.BUILD_REEL -> {
+                modeBCandidates = a.candidates
+                modeBTransitions = List((a.candidates.size - 1).coerceAtLeast(0)) {
+                    a.settings.defaultTransition
+                }
+            }
+        }
+        mode = Mode.REVIEWING
+    }
+}
 
-* Exception is:
-org.gradle.api.tasks.TaskExecutionException: Execution failed for task ':app:compileDebugKotlin'.
-	at org.gradle.api.internal.tasks.execution.ExecuteActionsTaskExecuter.lambda$executeIfValid$1(ExecuteActionsTaskExecuter.java:130)
-	at org.gradle.internal.Try$Failure.ifSuccessfulOrElse(Try.java:282)
-	at org.gradle.api.internal.tasks.execution.ExecuteActionsTaskExecuter.executeIfValid(ExecuteActionsTaskExecuter.java:128)
-	at org.gradle.api.internal.tasks.execution.ExecuteActionsTaskExecuter.execute(ExecuteActionsTaskExecuter.java:116)
-	at org.gradle.api.internal.tasks.execution.FinalizePropertiesTaskExecuter.execute(FinalizePropertiesTaskExecuter.java:46)
-	at org.gradle.api.internal.tasks.execution.ResolveTaskExecutionModeExecuter.execute(ResolveTaskExecutionModeExecuter.java:51)
-	at org.gradle.api.internal.tasks.execution.SkipTaskWithNoActionsExecuter.execute(SkipTaskWithNoActionsExecuter.java:57)
-	at org.gradle.api.internal.tasks.execution.SkipOnlyIfTaskExecuter.execute(SkipOnlyIfTaskExecuter.java:74)
-	at org.gradle.api.internal.tasks.execution.CatchExceptionTaskExecuter.execute(CatchExceptionTaskExecuter.java:36)
-	at org.gradle.api.internal.tasks.execution.EventFiringTaskExecuter$1.executeTask(EventFiringTaskExecuter.java:77)
-	at org.gradle.api.internal.tasks.execution.EventFiringTaskExecuter$1.call(EventFiringTaskExecuter.java:55)
-	at org.gradle.api.internal.tasks.execution.EventFiringTaskExecuter$1.call(EventFiringTaskExecuter.java:52)
-	at org.gradle.internal.operations.DefaultBuildOperationRunner$CallableBuildOperationWorker.execute(DefaultBuildOperationRunner.java:200)
-	at org.gradle.internal.operations.DefaultBuildOperationRunner$CallableBuildOperationWorker.execute(DefaultBuildOperationRunner.java:195)
-	at org.gradle.internal.operations.DefaultBuildOperationRunner$2.execute(DefaultBuildOperationRunner.java:66)
-	at org.gradle.internal.operations.DefaultBuildOperationRunner$2.execute(DefaultBuildOperationRunner.java:59)
-	at org.gradle.internal.operations.DefaultBuildOperationRunner.execute(DefaultBuildOperationRunner.java:157)
-	at org.gradle.internal.operations.DefaultBuildOperationRunner.execute(DefaultBuildOperationRunner.java:59)
-	at org.gradle.internal.operations.DefaultBuildOperationRunner.call(DefaultBuildOperationRunner.java:53)
-	at org.gradle.internal.operations.DefaultBuildOperationExecutor.call(DefaultBuildOperationExecutor.java:73)
-	at org.gradle.api.internal.tasks.execution.EventFiringTaskExecuter.execute(EventFiringTaskExecuter.java:52)
-	at org.gradle.execution.plan.LocalTaskNodeExecutor.execute(LocalTaskNodeExecutor.java:42)
-	at org.gradle.execution.taskgraph.DefaultTaskExecutionGraph$InvokeNodeExecutorsAction.execute(DefaultTaskExecutionGraph.java:331)
-	at org.gradle.execution.taskgraph.DefaultTaskExecutionGraph$InvokeNodeExecutorsAction.execute(DefaultTaskExecutionGraph.java:318)
-	at org.gradle.execution.taskgraph.DefaultTaskExecutionGraph$BuildOperationAwareExecutionAction.lambda$execute$0(DefaultTaskExecutionGraph.java:314)
-	at org.gradle.internal.operations.CurrentBuildOperationRef.with(CurrentBuildOperationRef.java:80)
-	at org.gradle.execution.taskgraph.DefaultTaskExecutionGraph$BuildOperationAwareExecutionAction.execute(DefaultTaskExecutionGraph.java:314)
-	at org.gradle.execution.taskgraph.DefaultTaskExecutionGraph$BuildOperationAwareExecutionAction.execute(DefaultTaskExecutionGraph.java:303)
-	at org.gradle.execution.plan.DefaultPlanExecutor$ExecutorWorker.execute(DefaultPlanExecutor.java:463)
-	at org.gradle.execution.plan.DefaultPlanExecutor$ExecutorWorker.run(DefaultPlanExecutor.java:380)
-	at org.gradle.internal.concurrent.ExecutorPolicy$CatchAndRecordFailures.onExecute(ExecutorPolicy.java:64)
-	at org.gradle.internal.concurrent.AbstractManagedExecutor$1.run(AbstractManagedExecutor.java:47)
-Caused by: org.gradle.workers.internal.DefaultWorkerExecutor$WorkExecutionException: A failure occurred while executing org.jetbrains.kotlin.compilerRunner.GradleCompilerRunnerWithWorkers$GradleKotlinCompilerWorkAction
-	at org.gradle.workers.internal.DefaultWorkerExecutor$WorkItemExecution.waitForCompletion(DefaultWorkerExecutor.java:287)
-	at org.gradle.internal.work.DefaultAsyncWorkTracker.lambda$waitForItemsAndGatherFailures$2(DefaultAsyncWorkTracker.java:130)
-	at org.gradle.internal.Factories$1.create(Factories.java:31)
-	at org.gradle.internal.work.DefaultWorkerLeaseService.withoutLocks(DefaultWorkerLeaseService.java:336)
-	at org.gradle.internal.work.DefaultWorkerLeaseService.withoutLocks(DefaultWorkerLeaseService.java:319)
-	at org.gradle.internal.work.DefaultWorkerLeaseService.withoutLock(DefaultWorkerLeaseService.java:324)
-	at org.gradle.internal.work.DefaultAsyncWorkTracker.waitForItemsAndGatherFailures(DefaultAsyncWorkTracker.java:126)
-	at org.gradle.internal.work.DefaultAsyncWorkTracker.waitForItemsAndGatherFailures(DefaultAsyncWorkTracker.java:92)
-	at org.gradle.internal.work.DefaultAsyncWorkTracker.waitForAll(DefaultAsyncWorkTracker.java:78)
-	at org.gradle.internal.work.DefaultAsyncWorkTracker.waitForCompletion(DefaultAsyncWorkTracker.java:66)
-	at org.gradle.api.internal.tasks.execution.TaskExecution$3.run(TaskExecution.java:252)
-	at org.gradle.internal.operations.DefaultBuildOperationRunner$1.execute(DefaultBuildOperationRunner.java:29)
-	at org.gradle.internal.operations.DefaultBuildOperationRunner$1.execute(DefaultBuildOperationRunner.java:26)
-	at org.gradle.internal.operations.DefaultBuildOperationRunner$2.execute(DefaultBuildOperationRunner.java:66)
-	at org.gradle.internal.operations.DefaultBuildOperationRunner$2.execute(DefaultBuildOperationRunner.java:59)
-	at org.gradle.internal.operations.DefaultBuildOperationRunner.execute(DefaultBuildOperationRunner.java:157)
-	at org.gradle.internal.operations.DefaultBuildOperationRunner.execute(DefaultBuildOperationRunner.java:59)
-	at org.gradle.internal.operations.DefaultBuildOperationRunner.run(DefaultBuildOperationRunner.java:47)
-	at org.gradle.internal.operations.DefaultBuildOperationExecutor.run(DefaultBuildOperationExecutor.java:68)
-	at org.gradle.api.internal.tasks.execution.TaskExecution.executeAction(TaskExecution.java:229)
-	at org.gradle.api.internal.tasks.execution.TaskExecution.executeActions(TaskExecution.java:212)
-	at org.gradle.api.internal.tasks.execution.TaskExecution.executeWithPreviousOutputFiles(TaskExecution.java:195)
-	at org.gradle.api.internal.tasks.execution.TaskExecution.execute(TaskExecution.java:162)
-	at org.gradle.internal.execution.steps.ExecuteStep.executeInternal(ExecuteStep.java:105)
-	at org.gradle.internal.execution.steps.ExecuteStep.access$000(ExecuteStep.java:44)
-	at org.gradle.internal.execution.steps.ExecuteStep$1.call(ExecuteStep.java:59)
-	at org.gradle.internal.execution.steps.ExecuteStep$1.call(ExecuteStep.java:56)
-	at org.gradle.internal.operations.DefaultBuildOperationRunner$CallableBuildOperationWorker.execute(DefaultBuildOperationRunner.java:200)
-	at org.gradle.internal.operations.DefaultBuildOperationRunner$CallableBuildOperationWorker.execute(DefaultBuildOperationRunner.java:195)
-	at org.gradle.internal.operations.DefaultBuildOperationRunner$2.execute(DefaultBuildOperationRunner.java:66)
-	at org.gradle.internal.operations.DefaultBuildOperationRunner$2.execute(DefaultBuildOperationRunner.java:59)
-	at org.gradle.internal.operations.DefaultBuildOperationRunner.execute(DefaultBuildOperationRunner.java:157)
-	at org.gradle.internal.operations.DefaultBuildOperationRunner.execute(DefaultBuildOperationRunner.java:59)
-	at org.gradle.internal.operations.DefaultBuildOperationRunner.call(DefaultBuildOperationRunner.java:53)
-	at org.gradle.internal.operations.DefaultBuildOperationExecutor.call(DefaultBuildOperationExecutor.java:73)
-	at org.gradle.internal.execution.steps.ExecuteStep.execute(ExecuteStep.java:56)
-	at org.gradle.internal.execution.steps.ExecuteStep.execute(ExecuteStep.java:44)
-	at org.gradle.internal.execution.steps.CancelExecutionStep.execute(CancelExecutionStep.java:41)
-	at org.gradle.internal.execution.steps.TimeoutStep.executeWithoutTimeout(TimeoutStep.java:74)
-	at org.gradle.internal.execution.steps.TimeoutStep.execute(TimeoutStep.java:55)
-	at org.gradle.internal.execution.steps.PreCreateOutputParentsStep.execute(PreCreateOutputParentsStep.java:50)
-	at org.gradle.internal.execution.steps.PreCreateOutputParentsStep.execute(PreCreateOutputParentsStep.java:28)
-	at org.gradle.internal.execution.steps.RemovePreviousOutputsStep.execute(RemovePreviousOutputsStep.java:67)
-	at org.gradle.internal.execution.steps.RemovePreviousOutputsStep.execute(RemovePreviousOutputsStep.java:37)
-	at org.gradle.internal.execution.steps.BroadcastChangingOutputsStep.execute(BroadcastChangingOutputsStep.java:61)
-	at org.gradle.internal.execution.steps.BroadcastChangingOutputsStep.execute(BroadcastChangingOutputsStep.java:26)
-	at org.gradle.internal.execution.steps.CaptureOutputsAfterExecutionStep.execute(CaptureOutputsAfterExecutionStep.java:67)
-	at org.gradle.internal.execution.steps.CaptureOutputsAfterExecutionStep.execute(CaptureOutputsAfterExecutionStep.java:45)
-	at org.gradle.internal.execution.steps.ResolveInputChangesStep.execute(ResolveInputChangesStep.java:40)
-	at org.gradle.internal.execution.steps.ResolveInputChangesStep.execute(ResolveInputChangesStep.java:29)
-	at org.gradle.internal.execution.steps.BuildCacheStep.executeWithoutCache(BuildCacheStep.java:189)
-	at org.gradle.internal.execution.steps.BuildCacheStep.lambda$execute$1(BuildCacheStep.java:75)
-	at org.gradle.internal.Either$Right.fold(Either.java:175)
-	at org.gradle.internal.execution.caching.CachingState.fold(CachingState.java:62)
-	at org.gradle.internal.execution.steps.BuildCacheStep.execute(BuildCacheStep.java:73)
-	at org.gradle.internal.execution.steps.BuildCacheStep.execute(BuildCacheStep.java:48)
-	at org.gradle.internal.execution.steps.StoreExecutionStateStep.execute(StoreExecutionStateStep.java:46)
-	at org.gradle.internal.execution.steps.StoreExecutionStateStep.execute(StoreExecutionStateStep.java:35)
-	at org.gradle.internal.execution.steps.SkipUpToDateStep.executeBecause(SkipUpToDateStep.java:76)
-	at org.gradle.internal.execution.steps.SkipUpToDateStep.lambda$execute$2(SkipUpToDateStep.java:54)
-	at org.gradle.internal.execution.steps.SkipUpToDateStep.execute(SkipUpToDateStep.java:54)
-	at org.gradle.internal.execution.steps.SkipUpToDateStep.execute(SkipUpToDateStep.java:36)
-	at org.gradle.internal.execution.steps.legacy.MarkSnapshottingInputsFinishedStep.execute(MarkSnapshottingInputsFinishedStep.java:37)
-	at org.gradle.internal.execution.steps.legacy.MarkSnapshottingInputsFinishedStep.execute(MarkSnapshottingInputsFinishedStep.java:27)
-	at org.gradle.internal.execution.steps.ResolveIncrementalCachingStateStep.executeDelegate(ResolveIncrementalCachingStateStep.java:49)
-	at org.gradle.internal.execution.steps.ResolveIncrementalCachingStateStep.executeDelegate(ResolveIncrementalCachingStateStep.java:27)
-	at org.gradle.internal.execution.steps.AbstractResolveCachingStateStep.execute(AbstractResolveCachingStateStep.java:71)
-	at org.gradle.internal.execution.steps.AbstractResolveCachingStateStep.execute(AbstractResolveCachingStateStep.java:39)
-	at org.gradle.internal.execution.steps.ResolveChangesStep.execute(ResolveChangesStep.java:65)
-	at org.gradle.internal.execution.steps.ResolveChangesStep.execute(ResolveChangesStep.java:36)
-	at org.gradle.internal.execution.steps.ValidateStep.execute(ValidateStep.java:106)
-	at org.gradle.internal.execution.steps.ValidateStep.execute(ValidateStep.java:55)
-	at org.gradle.internal.execution.steps.AbstractCaptureStateBeforeExecutionStep.execute(AbstractCaptureStateBeforeExecutionStep.java:64)
-	at org.gradle.internal.execution.steps.AbstractCaptureStateBeforeExecutionStep.execute(AbstractCaptureStateBeforeExecutionStep.java:43)
-	at org.gradle.internal.execution.steps.AbstractSkipEmptyWorkStep.executeWithNonEmptySources(AbstractSkipEmptyWorkStep.java:125)
-	at org.gradle.internal.execution.steps.AbstractSkipEmptyWorkStep.execute(AbstractSkipEmptyWorkStep.java:61)
-	at org.gradle.internal.execution.steps.AbstractSkipEmptyWorkStep.execute(AbstractSkipEmptyWorkStep.java:36)
-	at org.gradle.internal.execution.steps.legacy.MarkSnapshottingInputsStartedStep.execute(MarkSnapshottingInputsStartedStep.java:38)
-	at org.gradle.internal.execution.steps.LoadPreviousExecutionStateStep.execute(LoadPreviousExecutionStateStep.java:36)
-	at org.gradle.internal.execution.steps.LoadPreviousExecutionStateStep.execute(LoadPreviousExecutionStateStep.java:23)
-	at org.gradle.internal.execution.steps.HandleStaleOutputsStep.execute(HandleStaleOutputsStep.java:75)
-	at org.gradle.internal.execution.steps.HandleStaleOutputsStep.execute(HandleStaleOutputsStep.java:41)
-	at org.gradle.internal.execution.steps.AssignMutableWorkspaceStep.lambda$execute$0(AssignMutableWorkspaceStep.java:35)
-	at org.gradle.api.internal.tasks.execution.TaskExecution$4.withWorkspace(TaskExecution.java:289)
-	at org.gradle.internal.execution.steps.AssignMutableWorkspaceStep.execute(AssignMutableWorkspaceStep.java:31)
-	at org.gradle.internal.execution.steps.AssignMutableWorkspaceStep.execute(AssignMutableWorkspaceStep.java:22)
-	at org.gradle.internal.execution.steps.ChoosePipelineStep.execute(ChoosePipelineStep.java:40)
-	at org.gradle.internal.execution.steps.ChoosePipelineStep.execute(ChoosePipelineStep.java:23)
-	at org.gradle.internal.execution.steps.ExecuteWorkBuildOperationFiringStep.lambda$execute$2(ExecuteWorkBuildOperationFiringStep.java:67)
-	at org.gradle.internal.execution.steps.ExecuteWorkBuildOperationFiringStep.execute(ExecuteWorkBuildOperationFiringStep.java:67)
-	at org.gradle.internal.execution.steps.ExecuteWorkBuildOperationFiringStep.execute(ExecuteWorkBuildOperationFiringStep.java:39)
-	at org.gradle.internal.execution.steps.IdentityCacheStep.execute(IdentityCacheStep.java:46)
-	at org.gradle.internal.execution.steps.IdentityCacheStep.execute(IdentityCacheStep.java:34)
-	at org.gradle.internal.execution.steps.IdentifyStep.execute(IdentifyStep.java:48)
-	at org.gradle.internal.execution.steps.IdentifyStep.execute(IdentifyStep.java:35)
-	at org.gradle.internal.execution.impl.DefaultExecutionEngine$1.execute(DefaultExecutionEngine.java:61)
-	at org.gradle.api.internal.tasks.execution.ExecuteActionsTaskExecuter.executeIfValid(ExecuteActionsTaskExecuter.java:127)
-	at org.gradle.api.internal.tasks.execution.ExecuteActionsTaskExecuter.execute(ExecuteActionsTaskExecuter.java:116)
-	at org.gradle.api.internal.tasks.execution.FinalizePropertiesTaskExecuter.execute(FinalizePropertiesTaskExecuter.java:46)
-	at org.gradle.api.internal.tasks.execution.ResolveTaskExecutionModeExecuter.execute(ResolveTaskExecutionModeExecuter.java:51)
-	at org.gradle.api.internal.tasks.execution.SkipTaskWithNoActionsExecuter.execute(SkipTaskWithNoActionsExecuter.java:57)
-	at org.gradle.api.internal.tasks.execution.SkipOnlyIfTaskExecuter.execute(SkipOnlyIfTaskExecuter.java:74)
-	at org.gradle.api.internal.tasks.execution.CatchExceptionTaskExecuter.execute(CatchExceptionTaskExecuter.java:36)
-	at org.gradle.api.internal.tasks.execution.EventFiringTaskExecuter$1.executeTask(EventFiringTaskExecuter.java:77)
-	at org.gradle.api.internal.tasks.execution.EventFiringTaskExecuter$1.call(EventFiringTaskExecuter.java:55)
-	at org.gradle.api.internal.tasks.execution.EventFiringTaskExecuter$1.call(EventFiringTaskExecuter.java:52)
-	at org.gradle.internal.operations.DefaultBuildOperationRunner$CallableBuildOperationWorker.execute(DefaultBuildOperationRunner.java:200)
-	at org.gradle.internal.operations.DefaultBuildOperationRunner$CallableBuildOperationWorker.execute(DefaultBuildOperationRunner.java:195)
-	at org.gradle.internal.operations.DefaultBuildOperationRunner$2.execute(DefaultBuildOperationRunner.java:66)
-	at org.gradle.internal.operations.DefaultBuildOperationRunner$2.execute(DefaultBuildOperationRunner.java:59)
-	at org.gradle.internal.operations.DefaultBuildOperationRunner.execute(DefaultBuildOperationRunner.java:157)
-	at org.gradle.internal.operations.DefaultBuildOperationRunner.execute(DefaultBuildOperationRunner.java:59)
-	at org.gradle.internal.operations.DefaultBuildOperationRunner.call(DefaultBuildOperationRunner.java:53)
-	at org.gradle.internal.operations.DefaultBuildOperationExecutor.call(DefaultBuildOperationExecutor.java:73)
-	at org.gradle.api.internal.tasks.execution.EventFiringTaskExecuter.execute(EventFiringTaskExecuter.java:52)
-	at org.gradle.execution.plan.LocalTaskNodeExecutor.execute(LocalTaskNodeExecutor.java:42)
-	at org.gradle.execution.taskgraph.DefaultTaskExecutionGraph$InvokeNodeExecutorsAction.execute(DefaultTaskExecutionGraph.java:331)
-	at org.gradle.execution.taskgraph.DefaultTaskExecutionGraph$InvokeNodeExecutorsAction.execute(DefaultTaskExecutionGraph.java:318)
-	at org.gradle.execution.taskgraph.DefaultTaskExecutionGraph$BuildOperationAwareExecutionAction.lambda$execute$0(DefaultTaskExecutionGraph.java:314)
-	at org.gradle.internal.operations.CurrentBuildOperationRef.with(CurrentBuildOperationRef.java:80)
-	at org.gradle.execution.taskgraph.DefaultTaskExecutionGraph$BuildOperationAwareExecutionAction.execute(DefaultTaskExecutionGraph.java:314)
-	at org.gradle.execution.taskgraph.DefaultTaskExecutionGraph$BuildOperationAwareExecutionAction.execute(DefaultTaskExecutionGraph.java:303)
-	at org.gradle.execution.plan.DefaultPlanExecutor$ExecutorWorker.execute(DefaultPlanExecutor.java:463)
-	at org.gradle.execution.plan.DefaultPlanExecutor$ExecutorWorker.run(DefaultPlanExecutor.java:380)
-	at org.gradle.internal.concurrent.ExecutorPolicy$CatchAndRecordFailures.onExecute(ExecutorPolicy.java:64)
-	at org.gradle.internal.concurrent.AbstractManagedExecutor$1.run(AbstractManagedExecutor.java:47)
-Caused by: org.jetbrains.kotlin.gradle.tasks.CompilationErrorException: Compilation error. See log for more details
-	at org.jetbrains.kotlin.gradle.tasks.TasksUtilsKt.throwExceptionIfCompilationFailed(tasksUtils.kt:20)
-	at org.jetbrains.kotlin.compilerRunner.GradleKotlinCompilerWork.run(GradleKotlinCompilerWork.kt:141)
-	at org.jetbrains.kotlin.compilerRunner.GradleCompilerRunnerWithWorkers$GradleKotlinCompilerWorkAction.execute(GradleCompilerRunnerWithWorkers.kt:73)
-	at org.gradle.workers.internal.DefaultWorkerServer.execute(DefaultWorkerServer.java:63)
-	at org.gradle.workers.internal.NoIsolationWorkerFactory$1$1.create(NoIsolationWorkerFactory.java:66)
-	at org.gradle.workers.internal.NoIsolationWorkerFactory$1$1.create(NoIsolationWorkerFactory.java:62)
-	at org.gradle.internal.classloader.ClassLoaderUtils.executeInClassloader(ClassLoaderUtils.java:100)
-	at org.gradle.workers.internal.NoIsolationWorkerFactory$1.lambda$execute$0(NoIsolationWorkerFactory.java:62)
-	at org.gradle.workers.internal.AbstractWorker$1.call(AbstractWorker.java:44)
-	at org.gradle.workers.internal.AbstractWorker$1.call(AbstractWorker.java:41)
-	at org.gradle.internal.operations.DefaultBuildOperationRunner$CallableBuildOperationWorker.execute(DefaultBuildOperationRunner.java:200)
-	at org.gradle.internal.operations.DefaultBuildOperationRunner$CallableBuildOperationWorker.execute(DefaultBuildOperationRunner.java:195)
-	at org.gradle.internal.operations.DefaultBuildOperationRunner$2.execute(DefaultBuildOperationRunner.java:66)
-	at org.gradle.internal.operations.DefaultBuildOperationRunner$2.execute(DefaultBuildOperationRunner.java:59)
-	at org.gradle.internal.operations.DefaultBuildOperationRunner.execute(DefaultBuildOperationRunner.java:157)
-	at org.gradle.internal.operations.DefaultBuildOperationRunner.execute(DefaultBuildOperationRunner.java:59)
-	at org.gradle.internal.operations.DefaultBuildOperationRunner.call(DefaultBuildOperationRunner.java:53)
-	at org.gradle.internal.operations.DefaultBuildOperationExecutor.call(DefaultBuildOperationExecutor.java:73)
-	at org.gradle.workers.internal.AbstractWorker.executeWrappedInBuildOperation(AbstractWorker.java:41)
-	at org.gradle.workers.internal.NoIsolationWorkerFactory$1.execute(NoIsolationWorkerFactory.java:59)
-	at org.gradle.workers.internal.DefaultWorkerExecutor.lambda$submitWork$0(DefaultWorkerExecutor.java:174)
-	at org.gradle.internal.work.DefaultConditionalExecutionQueue$ExecutionRunner.runExecution(DefaultConditionalExecutionQueue.java:187)
-	at org.gradle.internal.work.DefaultConditionalExecutionQueue$ExecutionRunner.access$700(DefaultConditionalExecutionQueue.java:120)
-	at org.gradle.internal.work.DefaultConditionalExecutionQueue$ExecutionRunner$1.run(DefaultConditionalExecutionQueue.java:162)
-	at org.gradle.internal.Factories$1.create(Factories.java:31)
-	at org.gradle.internal.work.DefaultWorkerLeaseService.withLocks(DefaultWorkerLeaseService.java:264)
-	at org.gradle.internal.work.DefaultWorkerLeaseService.runAsWorkerThread(DefaultWorkerLeaseService.java:128)
-	at org.gradle.internal.work.DefaultWorkerLeaseService.runAsWorkerThread(DefaultWorkerLeaseService.java:133)
-	at org.gradle.internal.work.DefaultConditionalExecutionQueue$ExecutionRunner.runBatch(DefaultConditionalExecutionQueue.java:157)
-	at org.gradle.internal.work.DefaultConditionalExecutionQueue$ExecutionRunner.run(DefaultConditionalExecutionQueue.java:126)
-	... 2 more
+@Composable
+fun FindMomentScreen(
+    vm: MainViewModel,
+    state: FindMomentState,
+    onExportModeA: (MatchCandidate, Transition) -> Unit,
+    onExportModeB: (List<MatchCandidate>, List<Transition>) -> Unit,
+) {
+    // If we navigated away during analysis and came back, reset to picker
+    LaunchedEffect(Unit) {
+        if (state.mode == FindMomentState.Mode.ANALYZING) {
+            val job = state.detectorJob
+            if (job == null || !job.isActive) state.reset()
+        }
+    }
 
+    when (state.mode) {
+        FindMomentState.Mode.PICKING -> FindMomentPicker(vm, state)
+        FindMomentState.Mode.ANALYZING -> FindMomentAnalyzing(state)
+        FindMomentState.Mode.REVIEWING -> FindMomentReview(
+            state = state,
+            onExportModeA = onExportModeA,
+            onExportModeB = onExportModeB,
+        )
+    }
+}
 
-BUILD FAILED in 2m 34s
-Error: Process completed with exit code 1.
+// ============================================================================
+// PICKER SCREEN (Screen 1)
+// ============================================================================
+
+@Composable
+private fun FindMomentPicker(vm: MainViewModel, state: FindMomentState) {
+    val ctx = androidx.compose.ui.platform.LocalContext.current
+    val scope = rememberCoroutineScope()
+
+    // Clean up stale selection if folder changed
+    LaunchedEffect(vm.clips) {
+        val uris = vm.clips.map { it.uri }.toSet()
+        if (state.selectedClipUri != null && state.selectedClipUri !in uris) {
+            state.selectedClipUri = null
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Text(
+            "Describe what you want to find",
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.SemiBold,
+        )
+
+        // Query input
+        OutlinedTextField(
+            value = state.query,
+            onValueChange = { if (it.length <= 200) state.query = it },
+            label = { Text("What are you looking for?") },
+            placeholder = { Text("e.g. going through a tunnel, sunset, another cyclist") },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = false,
+            maxLines = 3,
+            keyboardOptions = KeyboardOptions(
+                capitalization = KeyboardCapitalization.Sentences
+            ),
+            supportingText = { Text("${state.query.length}/200") },
+        )
+
+        // Mode toggle (segmented control)
+        Column {
+            Text("Mode", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Spacer(Modifier.height(4.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                ModeChip(
+                    label = "Find one moment",
+                    selected = state.searchMode == FindMomentSettings.SearchMode.FIND_ONE_MOMENT,
+                    onClick = { state.searchMode = FindMomentSettings.SearchMode.FIND_ONE_MOMENT },
+                    modifier = Modifier.weight(1f),
+                )
+                ModeChip(
+                    label = "Build a reel",
+                    selected = state.searchMode == FindMomentSettings.SearchMode.BUILD_REEL,
+                    onClick = { state.searchMode = FindMomentSettings.SearchMode.BUILD_REEL },
+                    modifier = Modifier.weight(1f),
+                )
+            }
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = when (state.searchMode) {
+                    FindMomentSettings.SearchMode.FIND_ONE_MOMENT ->
+                        "Returns 3-5 candidate continuous segments. Pick the best one."
+                    FindMomentSettings.SearchMode.BUILD_REEL ->
+                        "Compiles multiple short moments into a single reel."
+                },
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+
+        // Length selector
+        Column {
+            Text("Output length", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Spacer(Modifier.height(4.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                for (len in listOf(30, 45, 60, 90)) {
+                    LengthChip(
+                        seconds = len,
+                        selected = state.targetLengthSec == len,
+                        onClick = { state.targetLengthSec = len },
+                    )
+                }
+            }
+        }
+
+        // Default transition (Mode B only — Mode A doesn't need it)
+        if (state.searchMode == FindMomentSettings.SearchMode.BUILD_REEL) {
+            Column {
+                Text("Transition between scenes", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Spacer(Modifier.height(4.dp))
+                TransitionPillRow(
+                    current = state.defaultTransition,
+                    onCycle = { state.defaultTransition = state.defaultTransition.next() },
+                )
+            }
+        }
+
+        Divider(Modifier.padding(vertical = 4.dp))
+
+        // Clip picker (radio-style — single select)
+        Text("Pick the source clip", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+        if (vm.clips.isEmpty()) {
+            Text(
+                "No clips loaded. Pick a folder first.",
+                fontSize = 13.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 4.dp),
+            )
+        } else {
+            for (clip in vm.clips) {
+                ClipRadioRow(
+                    clip = clip,
+                    selected = clip.uri == state.selectedClipUri,
+                    onSelect = { state.selectedClipUri = clip.uri },
+                )
+            }
+        }
+
+        Spacer(Modifier.height(12.dp))
+
+        // Analyze button
+        val canAnalyze = state.selectedClipUri != null && state.query.trim().length >= 3
+        Button(
+            onClick = {
+                val clip = vm.clips.firstOrNull { it.uri == state.selectedClipUri } ?: return@Button
+                val settings = FindMomentSettings(
+                    query = state.query.trim(),
+                    mode = state.searchMode,
+                    targetLengthMs = state.targetLengthSec * 1000L,
+                    defaultTransition = state.defaultTransition,
+                )
+                state.mode = FindMomentState.Mode.ANALYZING
+                state.expandedQueriesPreview = QueryExpander.expand(settings.query)
+                state.progress = FindMomentProgress(FindMomentPhase.EMBEDDING_QUERIES, 0f)
+
+                state.detectorJob = scope.launch {
+                    val detector = FindMomentDetector(ctx.applicationContext, clip, settings)
+                    detector.analyze().collect { evt ->
+                        when (evt) {
+                            is FindMomentEvent.Progress -> {
+                                state.progress = evt.progress
+                                if (evt.progress.phase == FindMomentPhase.CANCELLED ||
+                                    evt.progress.phase == FindMomentPhase.FAILED) {
+                                    state.mode = FindMomentState.Mode.PICKING
+                                }
+                            }
+                            is FindMomentEvent.Done -> {
+                                state.applyAnalysis(evt.analysis)
+                            }
+                        }
+                    }
+                }
+            },
+            enabled = canAnalyze,
+            modifier = Modifier.fillMaxWidth().height(48.dp),
+        ) {
+            Icon(Icons.Filled.AutoAwesome, null, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(8.dp))
+            Text("Analyze")
+        }
+    }
+}
+
+@Composable
+private fun ClipRadioRow(clip: VideoClip, selected: Boolean, onSelect: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .background(if (selected) MaterialTheme.colorScheme.primaryContainer else Color.Transparent)
+            .clickable { onSelect() }
+            .padding(horizontal = 8.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        RadioButton(selected = selected, onClick = onSelect)
+        Spacer(Modifier.width(8.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                clip.name,
+                fontSize = 14.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                "${formatDuration(clip.durationSec)} · ${"%.1f".format(clip.sizeMb)} MB",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun ModeChip(label: String, selected: Boolean, onClick: () -> Unit, modifier: Modifier = Modifier) {
+    val bg = if (selected) MaterialTheme.colorScheme.primary else Color.Transparent
+    val fg = if (selected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface
+    val border = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline
+    Box(
+        modifier = modifier
+            .clip(RoundedCornerShape(8.dp))
+            .border(1.dp, border, RoundedCornerShape(8.dp))
+            .background(bg)
+            .clickable { onClick() }
+            .padding(vertical = 10.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(label, color = fg, fontSize = 13.sp, fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal)
+    }
+}
+
+@Composable
+private fun LengthChip(seconds: Int, selected: Boolean, onClick: () -> Unit) {
+    val bg = if (selected) MaterialTheme.colorScheme.primary else Color.Transparent
+    val fg = if (selected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface
+    val border = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(20.dp))
+            .border(1.dp, border, RoundedCornerShape(20.dp))
+            .background(bg)
+            .clickable { onClick() }
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text("${seconds}s", color = fg, fontSize = 13.sp,
+             fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal)
+    }
+}
+
+@Composable
+private fun TransitionPillRow(current: Transition, onCycle: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(20.dp))
+            .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(20.dp))
+            .clickable { onCycle() }
+            .padding(horizontal = 14.dp, vertical = 8.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(current.displayName, fontSize = 13.sp)
+    }
+}
+
+// ============================================================================
+// ANALYZING SCREEN (Screen 2)
+// ============================================================================
+
+@Composable
+private fun FindMomentAnalyzing(state: FindMomentState) {
+    Column(
+        modifier = Modifier.fillMaxSize().padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = {
+                state.detectorJob?.cancel()
+                state.reset()
+            }) {
+                Icon(Icons.Filled.Close, "Cancel", tint = MaterialTheme.colorScheme.onSurface)
+            }
+            Text("Cancel", color = MaterialTheme.colorScheme.onSurface)
+        }
+
+        Spacer(Modifier.height(16.dp))
+
+        Text(
+            "Looking for: \"${state.query.trim()}\"",
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.SemiBold,
+        )
+
+        Text(
+            state.progress.phase.displayName,
+            color = MaterialTheme.colorScheme.primary,
+            fontSize = 15.sp,
+            fontWeight = FontWeight.Medium,
+        )
+
+        LinearProgressIndicator(
+            progress = state.progress.percent.coerceIn(0f, 1f),
+            modifier = Modifier.fillMaxWidth(),
+        )
+
+        if (state.progress.framesTotal > 0) {
+            Text(
+                "Frames: ${state.progress.framesProcessed} / ${state.progress.framesTotal}",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        if (state.progress.estimatedRemainingMs > 1000L) {
+            val secs = (state.progress.estimatedRemainingMs / 1000L).toInt()
+            Text(
+                "~ ${secs}s remaining",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        if (state.progress.errorMessage != null) {
+            Text(
+                "Error: ${state.progress.errorMessage}",
+                color = MaterialTheme.colorScheme.error,
+                fontSize = 13.sp,
+            )
+        }
+
+        Spacer(Modifier.height(24.dp))
+
+        if (state.expandedQueriesPreview.isNotEmpty()) {
+            Surface(
+                shape = RoundedCornerShape(8.dp),
+                color = MaterialTheme.colorScheme.surfaceVariant,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Column(modifier = Modifier.padding(12.dp)) {
+                    Text(
+                        "Searching for any of these phrasings:",
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontWeight = FontWeight.Medium,
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    for (q in state.expandedQueriesPreview) {
+                        Text("• $q", fontSize = 13.sp)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// REVIEW SCREEN (Screen 3) — different layouts for Mode A vs Mode B
+// ============================================================================
+
+@Composable
+private fun FindMomentReview(
+    state: FindMomentState,
+    onExportModeA: (MatchCandidate, Transition) -> Unit,
+    onExportModeB: (List<MatchCandidate>, List<Transition>) -> Unit,
+) {
+    val analysis = state.analysis ?: return
+    when (analysis.settings.mode) {
+        FindMomentSettings.SearchMode.FIND_ONE_MOMENT -> ReviewModeA(state, analysis, onExportModeA)
+        FindMomentSettings.SearchMode.BUILD_REEL -> ReviewModeB(state, analysis, onExportModeB)
+    }
+}
+
+@Composable
+private fun ReviewModeA(
+    state: FindMomentState,
+    analysis: FindMomentAnalysis,
+    onExport: (MatchCandidate, Transition) -> Unit,
+) {
+    Column(modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp, vertical = 8.dp)) {
+        Text(
+            "\"${analysis.settings.query}\"",
+            style = MaterialTheme.typography.titleSmall,
+            fontWeight = FontWeight.Medium,
+        )
+        Text(
+            "${analysis.candidates.size} moment(s) found",
+            fontSize = 13.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(12.dp))
+
+        if (analysis.candidates.isEmpty()) {
+            Text(
+                "No matching moments found. Try a different description or check the clip duration.",
+                color = MaterialTheme.colorScheme.error,
+                fontSize = 14.sp,
+            )
+        } else {
+            LazyColumn(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                itemsIndexed(analysis.candidates) { idx, cand ->
+                    CandidateCard(
+                        candidate = cand,
+                        index = idx,
+                        totalCount = analysis.candidates.size,
+                        selected = state.modeAChosenIdx == idx,
+                        onSelect = { state.modeAChosenIdx = idx },
+                    )
+                }
+            }
+        }
+
+        // Bottom actions
+        Spacer(Modifier.height(12.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(
+                onClick = { state.reset() },
+                modifier = Modifier.weight(1f),
+            ) {
+                Text("Different query")
+            }
+            Button(
+                onClick = {
+                    val idx = state.modeAChosenIdx ?: return@Button
+                    val cand = analysis.candidates.getOrNull(idx) ?: return@Button
+                    onExport(cand, state.defaultTransition)
+                },
+                enabled = state.modeAChosenIdx != null,
+                modifier = Modifier.weight(1f),
+            ) {
+                Text("Export")
+            }
+        }
+    }
+}
+
+@Composable
+private fun CandidateCard(
+    candidate: MatchCandidate,
+    index: Int,
+    totalCount: Int,
+    selected: Boolean,
+    onSelect: () -> Unit,
+) {
+    Surface(
+        shape = RoundedCornerShape(8.dp),
+        color = if (selected) MaterialTheme.colorScheme.primaryContainer
+                else MaterialTheme.colorScheme.surface,
+        border = if (selected) androidx.compose.foundation.BorderStroke(
+            2.dp, MaterialTheme.colorScheme.primary
+        ) else androidx.compose.foundation.BorderStroke(
+            1.dp, MaterialTheme.colorScheme.outlineVariant
+        ),
+        modifier = Modifier.fillMaxWidth().clickable { onSelect() },
+    ) {
+        Column(modifier = Modifier.padding(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "Moment ${index + 1} of $totalCount",
+                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 14.sp,
+                    modifier = Modifier.weight(1f),
+                )
+                Text(
+                    scoreLabel(candidate.score),
+                    color = scoreColor(candidate.score),
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium,
+                )
+            }
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "${formatMs(candidate.startMs)} — ${formatMs(candidate.endMs)} (${(candidate.durationMs / 1000).toInt()}s)",
+                fontSize = 13.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                "Peak at ${formatMs(candidate.peakMs)} · score ${"%.2f".format(candidate.score)}",
+                fontSize = 11.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun ReviewModeB(
+    state: FindMomentState,
+    analysis: FindMomentAnalysis,
+    onExport: (List<MatchCandidate>, List<Transition>) -> Unit,
+) {
+    val totalMs = state.modeBCandidates.sumOf { it.durationMs }
+    Column(modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp, vertical = 8.dp)) {
+        Text(
+            "\"${analysis.settings.query}\"",
+            style = MaterialTheme.typography.titleSmall,
+            fontWeight = FontWeight.Medium,
+        )
+        Text(
+            "Reel: ${formatMs(totalMs)} · ${state.modeBCandidates.size} scenes",
+            fontSize = 13.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(12.dp))
+
+        if (state.modeBCandidates.isEmpty()) {
+            Text(
+                "No matching scenes found.",
+                color = MaterialTheme.colorScheme.error,
+                fontSize = 14.sp,
+            )
+        } else {
+            LazyColumn(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                itemsIndexed(state.modeBCandidates) { idx, cand ->
+                    Column {
+                        ReelSceneRow(
+                            cand = cand,
+                            index = idx,
+                            onDelete = {
+                                val newList = state.modeBCandidates.toMutableList().apply { removeAt(idx) }
+                                val newTrans = state.modeBTransitions.toMutableList()
+                                if (idx < newTrans.size) newTrans.removeAt(idx)
+                                else if (newTrans.isNotEmpty() && idx == newList.size) newTrans.removeAt(newTrans.size - 1)
+                                state.modeBCandidates = newList
+                                state.modeBTransitions = newTrans
+                            },
+                        )
+                        if (idx < state.modeBCandidates.size - 1) {
+                            TransitionRow(
+                                current = state.modeBTransitions.getOrElse(idx) { analysis.settings.defaultTransition },
+                                onCycle = {
+                                    val updated = state.modeBTransitions.toMutableList()
+                                    while (updated.size <= idx) updated.add(analysis.settings.defaultTransition)
+                                    updated[idx] = updated[idx].next()
+                                    state.modeBTransitions = updated
+                                },
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        Spacer(Modifier.height(12.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(
+                onClick = { state.reset() },
+                modifier = Modifier.weight(1f),
+            ) {
+                Text("Adjust query")
+            }
+            Button(
+                onClick = { onExport(state.modeBCandidates, state.modeBTransitions) },
+                enabled = state.modeBCandidates.isNotEmpty(),
+                modifier = Modifier.weight(1f),
+            ) {
+                Text("Export reel")
+            }
+        }
+    }
+}
+
+@Composable
+private fun ReelSceneRow(cand: MatchCandidate, index: Int, onDelete: () -> Unit) {
+    Surface(
+        shape = RoundedCornerShape(8.dp),
+        color = MaterialTheme.colorScheme.surface,
+        border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            modifier = Modifier.padding(10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                "${index + 1}",
+                fontWeight = FontWeight.Bold,
+                fontSize = 14.sp,
+                color = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.width(24.dp),
+            )
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    "${formatMs(cand.startMs)} — ${formatMs(cand.endMs)} (${(cand.durationMs / 1000).toInt()}s)",
+                    fontSize = 13.sp,
+                )
+                Text(
+                    "score ${"%.2f".format(cand.score)}",
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            IconButton(onClick = onDelete) {
+                Icon(Icons.Filled.Delete, "Delete", tint = MaterialTheme.colorScheme.error)
+            }
+        }
+    }
+}
+
+@Composable
+private fun TransitionRow(current: Transition, onCycle: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 2.dp),
+        horizontalArrangement = Arrangement.Center,
+    ) {
+        Box(
+            modifier = Modifier
+                .clip(RoundedCornerShape(12.dp))
+                .background(MaterialTheme.colorScheme.surfaceVariant)
+                .clickable { onCycle() }
+                .padding(horizontal = 12.dp, vertical = 4.dp),
+        ) {
+            Text(
+                current.displayName,
+                fontSize = 11.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+private fun formatMs(ms: Long): String {
+    val totalSec = ms / 1000L
+    val h = totalSec / 3600L
+    val m = (totalSec % 3600L) / 60L
+    val s = totalSec % 60L
+    return if (h > 0) "%d:%02d:%02d".format(h, m, s)
+           else "%d:%02d".format(m, s)
+}
+
+private fun scoreLabel(score: Float): String = when {
+    score >= 0.6f -> "Strong match"
+    score >= 0.4f -> "Good match"
+    score >= 0.25f -> "Weak match"
+    else -> "Low confidence"
+}
+
+private fun scoreColor(score: Float): Color = when {
+    score >= 0.6f -> Color(0xFF2E7D32)
+    score >= 0.4f -> Color(0xFFFB8C00)
+    score >= 0.25f -> Color(0xFFE65100)
+    else -> Color(0xFFB71C1C)
+}
