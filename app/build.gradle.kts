@@ -11,8 +11,8 @@ android {
         applicationId = "com.camcompiler.app"
         minSdk = 24
         targetSdk = 34
-        versionCode = 8
-        versionName = "8.0"
+        versionCode = 9
+        versionName = "9.0"
     }
 
     buildTypes {
@@ -42,6 +42,12 @@ android {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
+    }
+
+    androidResources {
+        // TFLite models must not be compressed in the APK so they can be memory-mapped
+        // at runtime via MappedByteBuffer. Without this, model loading fails.
+        noCompress += "tflite"
     }
 }
 
@@ -80,4 +86,8 @@ dependencies {
 
     // DataStore - persistent preferences (last folder)
     implementation("androidx.datastore:datastore-preferences:1.1.1")
+
+    // TensorFlow Lite - on-device ML for Find Moment feature (MobileCLIP)
+    implementation("org.tensorflow:tensorflow-lite:2.14.0")
+    implementation("org.tensorflow:tensorflow-lite-support:0.4.4")
 }
