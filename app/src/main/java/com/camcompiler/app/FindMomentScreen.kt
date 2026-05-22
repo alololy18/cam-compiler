@@ -2,6 +2,7 @@
 package com.camcompiler.app
 
 import android.net.Uri
+import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -251,7 +252,19 @@ private fun FindMomentPicker(vm: MainViewModel, state: FindMomentState) {
         val canAnalyze = state.selectedClipUri != null && state.query.trim().length >= 3
         Button(
             onClick = {
-                val clip = vm.clips.firstOrNull { it.uri == state.selectedClipUri } ?: return@Button
+                // DEBUG v9.1: confirm the click actually reaches us
+                Toast.makeText(ctx, "Analyze tapped", Toast.LENGTH_SHORT).show()
+
+                val clip = vm.clips.firstOrNull { it.uri == state.selectedClipUri }
+                if (clip == null) {
+                    // DEBUG v9.1: surface the rare clip-lookup miss (selected URI not in vm.clips)
+                    Toast.makeText(
+                        ctx,
+                        "Selected clip not found in folder. Re-select and try again.",
+                        Toast.LENGTH_LONG
+                    ).show()
+                    return@Button
+                }
                 val settings = FindMomentSettings(
                     query = state.query.trim(),
                     mode = state.searchMode,
@@ -263,20 +276,40 @@ private fun FindMomentPicker(vm: MainViewModel, state: FindMomentState) {
                 state.progress = FindMomentProgress(FindMomentPhase.EMBEDDING_QUERIES, 0f)
 
                 state.detectorJob = scope.launch {
-                    val detector = FindMomentDetector(ctx.applicationContext, clip, settings)
-                    detector.analyze().collect { evt ->
-                        when (evt) {
-                            is FindMomentEvent.Progress -> {
-                                state.progress = evt.progress
-                                if (evt.progress.phase == FindMomentPhase.CANCELLED ||
-                                    evt.progress.phase == FindMomentPhase.FAILED) {
-                                    state.mode = FindMomentState.Mode.PICKING
+                    try {
+                        val detector = FindMomentDetector(ctx.applicationContext, clip, settings)
+                        detector.analyze().collect { evt ->
+                            when (evt) {
+                                is FindMomentEvent.Progress -> {
+                                    state.progress = evt.progress
+                                    if (evt.progress.phase == FindMomentPhase.FAILED) {
+                                        // DEBUG v9.1: surface the actual error message before bouncing back
+                                        Toast.makeText(
+                                            ctx,
+                                            "Find Moment failed: ${evt.progress.errorMessage ?: "unknown error"}",
+                                            Toast.LENGTH_LONG
+                                        ).show()
+                                        state.mode = FindMomentState.Mode.PICKING
+                                    } else if (evt.progress.phase == FindMomentPhase.CANCELLED) {
+                                        state.mode = FindMomentState.Mode.PICKING
+                                    }
+                                }
+                                is FindMomentEvent.Done -> {
+                                    state.applyAnalysis(evt.analysis)
                                 }
                             }
-                            is FindMomentEvent.Done -> {
-                                state.applyAnalysis(evt.analysis)
-                            }
                         }
+                    } catch (ce: kotlinx.coroutines.CancellationException) {
+                        // Don't toast on user-initiated cancel
+                        throw ce
+                    } catch (t: Throwable) {
+                        // DEBUG v9.1: catch anything the inner try/catch in analyze() missed
+                        Toast.makeText(
+                            ctx,
+                            "Find Moment crashed: ${t.javaClass.simpleName}: ${t.message ?: "no message"}",
+                            Toast.LENGTH_LONG
+                        ).show()
+                        state.mode = FindMomentState.Mode.PICKING
                     }
                 }
             },
